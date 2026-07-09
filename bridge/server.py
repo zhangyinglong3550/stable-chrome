@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = os.getenv("STABLE_CHROME_HOST", "127.0.0.1")
 PORT = int(os.getenv("STABLE_CHROME_PORT", "19527"))
-EXT_ONLINE_TTL_MS = int(os.getenv("STABLE_CHROME_EXT_TTL_MS", "8000"))
+EXT_ONLINE_TTL_MS = int(os.getenv("STABLE_CHROME_EXT_TTL_MS", "32000"))
 DEFAULT_TIMEOUT_MS = int(os.getenv("STABLE_CHROME_CMD_TIMEOUT_MS", "20000"))
 LOG_DIR = Path(os.getenv("STABLE_CHROME_LOG_DIR", str(Path(__file__).resolve().parent.parent / "logs")))
 LOG_DIR.mkdir(parents=True, exist_ok=True)

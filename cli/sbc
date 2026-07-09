@@ -187,6 +187,55 @@ def cmd_reload(args: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
+def cmd_net_start(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("startNetCapture", params, timeout_ms=10000)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_net_get(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("getNetCapture", params, timeout_ms=10000)
+    if not r.get("ok"):
+        return out(r, 1)
+    requests = (r.get("result") or {}).get("requests", [])
+    # 只输出非资源请求（过滤 js/css/img/font/woff）
+    if args.filter:
+        skip = ('.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.woff', '.woff2', '.ttf', '.svg', '.ico', '.map')
+        requests = [req for req in requests if not any(req['url'].split('?')[0].endswith(s) for s in skip)]
+    if args.grep:
+        requests = [req for req in requests if args.grep in req['url']]
+    for req in requests:
+        body_hint = f" | {req['postData'][:80]}" if req.get('postData') else ""
+        print(f"{req.get('status','?'):>3}  {req['method']:<6} {req['url']}{body_hint}")
+    print(f"\n--- {len(requests)} requests ---")
+    return 0
+
+
+def cmd_net_stop(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("stopNetCapture", params, timeout_ms=10000)
+    if not r.get("ok"):
+        return out(r, 1)
+    requests = (r.get("result") or {}).get("requests", [])
+    if args.filter:
+        skip = ('.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.woff', '.woff2', '.ttf', '.svg', '.ico', '.map')
+        requests = [req for req in requests if not any(req['url'].split('?')[0].endswith(s) for s in skip)]
+    if args.grep:
+        requests = [req for req in requests if args.grep in req['url']]
+    for req in requests:
+        body_hint = f" | {req['postData'][:80]}" if req.get('postData') else ""
+        print(f"{req.get('status','?'):>3}  {req['method']:<6} {req['url']}{body_hint}")
+    print(f"\n--- {len(requests)} requests ---")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sbc", description="stable-chrome CLI")
     p.add_argument("--bridge", default=DEFAULT_BRIDGE, help="bridge base url")
@@ -264,6 +313,22 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--tab-id")
     rl.add_argument("--bypass-cache", action="store_true")
     rl.set_defaults(func=cmd_reload)
+
+    ns = sub.add_parser("net-start", help="start CDP network capture on tab")
+    ns.add_argument("--tab-id")
+    ns.set_defaults(func=cmd_net_start)
+
+    ng = sub.add_parser("net-get", help="read captured requests (keep capturing)")
+    ng.add_argument("--tab-id")
+    ng.add_argument("--filter", action="store_true", default=True, help="skip static assets")
+    ng.add_argument("--grep", default="", help="filter by URL substring")
+    ng.set_defaults(func=cmd_net_get)
+
+    nst = sub.add_parser("net-stop", help="stop capture and print all requests")
+    nst.add_argument("--tab-id")
+    nst.add_argument("--filter", action="store_true", default=True)
+    nst.add_argument("--grep", default="", help="filter by URL substring")
+    nst.set_defaults(func=cmd_net_stop)
 
     return p
 

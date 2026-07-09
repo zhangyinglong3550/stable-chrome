@@ -46,6 +46,9 @@ sbc end-task
 | `sbc wait --text|--selector` | 等待 |
 | `sbc screenshot --out` | 截图 |
 | `sbc end-task [--close-group]` | 结束任务 |
+| `sbc net-start [--tab-id]` | 开始 CDP 网络捕获 |
+| `sbc net-get [--tab-id] [--grep STR]` | 读取捕获的 API 请求（不停止） |
+| `sbc net-stop [--tab-id] [--grep STR]` | 停止捕获并输出所有请求 |
 
 ## 硬规则
 1. **禁止**默认使用 9222 / 复制 profile / 匿名 Chromium 冒充连接成功
@@ -55,12 +58,14 @@ sbc end-task
 
 ## 故障排查
 ```bash
-~/code/stable-chrome/scripts/doctor.sh
+sbc doctor
 # 看 extension.online / hints
 # 扩展 service worker 控制台应持续请求 /ext/poll
 ```
 
 ## 实现路径
-- 项目根：`/Users/zhangyinglong/code/stable-chrome`
-- CLI：`/Users/zhangyinglong/code/stable-chrome/cli/sbc`
-- Bridge：`/Users/zhangyinglong/code/stable-chrome/bridge/server.py`
+安装后在仓库根目录找到对应文件：
+- CLI：`cli/sbc`（建议加入 PATH）
+- Bridge：`bridge/server.py`
+- Chrome 扩展：`extension/`
+- 启动脚本：`scripts/start-bridge.sh`

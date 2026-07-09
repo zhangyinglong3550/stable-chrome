@@ -7,6 +7,10 @@ const BRIDGE = 'http://127.0.0.1:19527';
 const POLL_WAIT_MS = 25000;
 const HELLO_EVERY_MS = 5000;
 
+// SW 被 Chrome 挂起后，上下文重置，pollLoop 会停掉。
+// alarm 唤醒时用此标志判断是否需要重新启动。
+let _pollRunning = false;
+
 const state = {
   taskActive: false,
   taskTitle: 'Claude Task',
@@ -562,6 +566,59 @@ async function screenshot(params = {}) {
   };
 }
 
+// ── Network capture via chrome.debugger ──────────────────────────────────────
+const _netCapture = new Map(); // tabId → { requests: [], navigations: [] }
+
+async function startNetCapture(tabId) {
+  const id = Number(tabId);
+  if (Number.isNaN(id)) throw new Error('invalid tabId');
+  // detach if already attached
+  try { await chrome.debugger.detach({ tabId: id }); } catch {}
+  await chrome.debugger.attach({ tabId: id }, '1.3');
+  _netCapture.set(id, { requests: [], navigations: [] });
+  await chrome.debugger.sendCommand({ tabId: id }, 'Network.enable', {});
+  return { ok: true, tabId: String(id), status: 'capturing' };
+}
+
+async function stopNetCapture(tabId) {
+  const id = Number(tabId);
+  const data = _netCapture.get(id) || { requests: [], navigations: [] };
+  _netCapture.delete(id);
+  try { await chrome.debugger.detach({ tabId: id }); } catch {}
+  return { ok: true, tabId: String(id), requests: data.requests, navigations: data.navigations };
+}
+
+function getNetCapture(tabId) {
+  const id = Number(tabId);
+  const data = _netCapture.get(id) || { requests: [], navigations: [] };
+  return { ok: true, tabId: String(id), requests: data.requests, navigations: data.navigations };
+}
+
+// CDP event listener for network capture
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const data = _netCapture.get(source.tabId);
+  if (!data) return;
+  if (method === 'Network.requestWillBeSent') {
+    const r = params.request;
+    data.requests.push({
+      requestId: params.requestId,
+      url: r.url,
+      method: r.method,
+      postData: r.postData ? r.postData.slice(0, 500) : null,
+      headers: Object.fromEntries(
+        Object.entries(r.headers || {}).filter(([k]) =>
+          ['content-type', 'authorization', 'x-requested-with', 'accept'].includes(k.toLowerCase())
+        )
+      ),
+    });
+  }
+  if (method === 'Network.responseReceived') {
+    const req = data.requests.find(r => r.requestId === params.requestId);
+    if (req) req.status = params.response.status;
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function handleCommand(cmd) {
   const type = cmd?.type;
   const params = cmd?.params || {};
@@ -612,6 +669,12 @@ async function handleCommand(cmd) {
       return content(params);
     case 'screenshot':
       return screenshot(params);
+    case 'startNetCapture':
+      return startNetCapture(params.tabId || state.claimedTabId);
+    case 'stopNetCapture':
+      return stopNetCapture(params.tabId || state.claimedTabId);
+    case 'getNetCapture':
+      return getNetCapture(params.tabId || state.claimedTabId);
     default:
       throw new Error(`unknown command: ${type}`);
   }
@@ -629,6 +692,9 @@ async function postResult(id, ok, result, error) {
 }
 
 async function pollLoop() {
+  if (_pollRunning) return; // 防重入
+  _pollRunning = true;
+  console.log('[stable-chrome] pollLoop started');
   while (!state.pollAbort) {
     try {
       await hello();
@@ -650,6 +716,7 @@ async function pollLoop() {
       await sleep(1500);
     }
   }
+  _pollRunning = false;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -668,11 +735,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === 'complete') await groupTabIfNeeded(tabId);
 });
 
-// keep-alive alarm
-chrome.alarms.create('stable-chrome-keepalive', { periodInMinutes: 0.5 });
+// keep-alive alarm：每 15s 触发一次，唤醒 SW 并确保 pollLoop 在跑
+chrome.alarms.create('stable-chrome-keepalive', { periodInMinutes: 0.25 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'stable-chrome-keepalive') {
     hello().catch(() => {});
+    // SW 被 suspend 后上下文重置，_pollRunning 归 false，重新启动 loop
+    if (!_pollRunning) {
+      console.log('[stable-chrome] alarm revived pollLoop');
+      pollLoop();
+    }
   }
 });
 
