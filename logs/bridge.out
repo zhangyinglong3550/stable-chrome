@@ -1,5 +1,0 @@
-[2026-07-09 11:41:00] stable-chrome bridge listening on http://127.0.0.1:19527
-[2026-07-09 11:41:00] waiting for Chrome extension to poll /ext/poll ...
-[2026-07-09 11:41:01] HTTP 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-09 11:41:02] HTTP 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-09 11:41:02] HTTP 127.0.0.1 "GET /doctor HTTP/1.1" 200 -
