@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""stable-chrome CLI (sbc)
+
+Talks to local bridge at http://127.0.0.1:19527
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+DEFAULT_BRIDGE = os.getenv("STABLE_CHROME_BRIDGE", "http://127.0.0.1:19527")
+
+
+def http_json(method: str, path: str, body: Optional[dict] = None, timeout: float = 30.0) -> dict:
+    url = DEFAULT_BRIDGE.rstrip("/") + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw else {"ok": False, "error": str(e)}
+        except Exception:
+            payload = {"ok": False, "error": raw or str(e)}
+        payload.setdefault("ok", False)
+        payload.setdefault("httpStatus", e.code)
+        return payload
+    except Exception as e:
+        return {"ok": False, "error": f"bridge unreachable: {e}", "bridge": DEFAULT_BRIDGE}
+
+
+def out(data: Any, code: int = 0) -> int:
+    if isinstance(data, (dict, list)):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(data)
+    return code
+
+
+def cmd_health(_: argparse.Namespace) -> int:
+    r = http_json("GET", "/health", timeout=3)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    r = http_json("GET", "/doctor", timeout=3)
+    return out(r, 0 if r.get("ok") and (r.get("extension") or {}).get("online") else 1)
+
+
+def run_cmd(type_: str, params: Optional[dict] = None, timeout_ms: int = 20000) -> dict:
+    body = {"type": type_, "params": params or {}, "timeoutMs": timeout_ms}
+    # also flatten params for convenience
+    if params:
+        body.update(params)
+    return http_json("POST", "/cmd", body, timeout=timeout_ms / 1000.0 + 5)
+
+
+def cmd_open_tabs(_: argparse.Namespace) -> int:
+    r = run_cmd("openTabs")
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    if args.tab_id:
+        r = run_cmd("claimTab", {"tabId": args.tab_id, "title": args.title})
+    else:
+        r = run_cmd("claimCurrentTab", {"title": args.title})
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_start_task(args: argparse.Namespace) -> int:
+    r = run_cmd("startTask", {"title": args.title})
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_end_task(args: argparse.Namespace) -> int:
+    r = run_cmd("endTask", {"closeGroup": bool(args.close_group)})
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_new_tab(args: argparse.Namespace) -> int:
+    r = run_cmd("newTab", {"url": args.url, "active": not args.background})
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_goto(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"url": args.url}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("goto", params, timeout_ms=args.timeout_ms)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_click(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.selector:
+        params["selector"] = args.selector
+    if args.text:
+        params["text"] = args.text
+    if args.index is not None:
+        params["index"] = args.index
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("click", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_fill(args: argparse.Namespace) -> int:
+    params = {"selector": args.selector, "value": args.value}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("fill", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    params = {"expression": args.expression}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("eval", params, timeout_ms=args.timeout_ms)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"max": args.max}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("snapshot", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_content(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("content", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"timeoutMs": args.timeout_ms}
+    if args.selector:
+        params["selector"] = args.selector
+    if args.text:
+        params["text"] = args.text
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("waitFor", params, timeout_ms=args.timeout_ms + 2000)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_screenshot(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("screenshot", params, timeout_ms=30000)
+    if not r.get("ok"):
+        return out(r, 1)
+    result = r.get("result") or {}
+    b64 = result.get("base64") or ""
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(base64.b64decode(b64))
+    return out({"ok": True, "path": str(out_path), "tabId": result.get("tabId")}, 0)
+
+
+def cmd_reload(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"bypassCache": bool(args.bypass_cache)}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("reload", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="sbc", description="stable-chrome CLI")
+    p.add_argument("--bridge", default=DEFAULT_BRIDGE, help="bridge base url")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("health", help="bridge health").set_defaults(func=cmd_health)
+    sub.add_parser("doctor", help="full diagnostics").set_defaults(func=cmd_doctor)
+    sub.add_parser("open-tabs", help="list open tabs").set_defaults(func=cmd_open_tabs)
+
+    c = sub.add_parser("claim", help="claim tab (current if no --tab-id)")
+    c.add_argument("--tab-id")
+    c.add_argument("--title", default="Claude Task")
+    c.set_defaults(func=cmd_claim)
+
+    s = sub.add_parser("start-task", help="start task / ensure tab group")
+    s.add_argument("--title", default="Claude Task")
+    s.set_defaults(func=cmd_start_task)
+
+    e = sub.add_parser("end-task", help="end task")
+    e.add_argument("--close-group", action="store_true")
+    e.set_defaults(func=cmd_end_task)
+
+    n = sub.add_parser("new-tab", help="open new tab in task group")
+    n.add_argument("--url", default="about:blank")
+    n.add_argument("--background", action="store_true")
+    n.set_defaults(func=cmd_new_tab)
+
+    g = sub.add_parser("goto", help="navigate")
+    g.add_argument("url")
+    g.add_argument("--tab-id")
+    g.add_argument("--timeout-ms", type=int, default=30000)
+    g.set_defaults(func=cmd_goto)
+
+    cl = sub.add_parser("click", help="click element")
+    cl.add_argument("--selector")
+    cl.add_argument("--text")
+    cl.add_argument("--index", type=int)
+    cl.add_argument("--tab-id")
+    cl.set_defaults(func=cmd_click)
+
+    f = sub.add_parser("fill", help="fill input")
+    f.add_argument("--selector", required=True)
+    f.add_argument("--value", required=True)
+    f.add_argument("--tab-id")
+    f.set_defaults(func=cmd_fill)
+
+    ev = sub.add_parser("eval", help="eval JS expression")
+    ev.add_argument("expression")
+    ev.add_argument("--tab-id")
+    ev.add_argument("--timeout-ms", type=int, default=20000)
+    ev.set_defaults(func=cmd_eval)
+
+    sn = sub.add_parser("snapshot", help="list interactive elements")
+    sn.add_argument("--max", type=int, default=80)
+    sn.add_argument("--tab-id")
+    sn.set_defaults(func=cmd_snapshot)
+
+    co = sub.add_parser("content", help="read page content summary")
+    co.add_argument("--tab-id")
+    co.set_defaults(func=cmd_content)
+
+    w = sub.add_parser("wait", help="wait for selector or text")
+    w.add_argument("--selector")
+    w.add_argument("--text")
+    w.add_argument("--tab-id")
+    w.add_argument("--timeout-ms", type=int, default=15000)
+    w.set_defaults(func=cmd_wait)
+
+    sc = sub.add_parser("screenshot", help="screenshot active tab")
+    sc.add_argument("--out", default=str(Path.home() / "file/codex/sbc-screenshot.png"))
+    sc.add_argument("--tab-id")
+    sc.set_defaults(func=cmd_screenshot)
+
+    rl = sub.add_parser("reload", help="reload tab")
+    rl.add_argument("--tab-id")
+    rl.add_argument("--bypass-cache", action="store_true")
+    rl.set_defaults(func=cmd_reload)
+
+    return p
+
+
+def main(argv: Optional[list] = None) -> int:
+    global DEFAULT_BRIDGE
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "bridge", None):
+        DEFAULT_BRIDGE = args.bridge
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

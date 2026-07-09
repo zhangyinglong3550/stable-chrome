@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Stable Chrome Attach",
+  "version": "0.1.0",
+  "description": "Attach Claude/local agents to real Chrome tabs with task tab groups. No CDP 9222 required.",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "activeTab",
+    "storage",
+    "alarms",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:19527/*",
+    "http://localhost:19527/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Stable Chrome Attach",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

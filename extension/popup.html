@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+      margin: 0;
+      padding: 12px;
+      width: 280px;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    .row { font-size: 12px; margin: 6px 0; color: #334155; }
+    .ok { color: #15803d; font-weight: 600; }
+    .bad { color: #b91c1c; font-weight: 600; }
+    code { font-size: 11px; background: #e2e8f0; padding: 1px 4px; border-radius: 4px; }
+    button {
+      margin-top: 8px;
+      width: 100%;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px;
+      background: #0f8f8c;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>Stable Chrome Attach</h1>
+  <div class="row">扩展 ID：<code id="extId">-</code></div>
+  <div class="row">Bridge：<span id="bridge">检测中…</span></div>
+  <div class="row">说明：保持本扩展启用 + 本地 bridge 运行，即可被 Claude/CLI 附着控制。</div>
+  <button id="retry">重新检测 Bridge</button>
+  <script src="popup.js"></script>
+</body>
+</html>
