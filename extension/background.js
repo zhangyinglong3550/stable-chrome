@@ -11,15 +11,28 @@ const HELLO_EVERY_MS = 5000;
 // alarm 唤醒时用此标志判断是否需要重新启动。
 let _pollRunning = false;
 
+// Chrome tabGroups 支持的颜色（新建分组时轮换/随机，避免永远同一色）
+const GROUP_COLORS = ['blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'grey'];
+
 const state = {
   taskActive: false,
   taskTitle: 'Claude Task',
   taskGroupId: null,
+  taskGroupColor: null,
   rootTabId: null,
   claimedTabId: null,
   pollAbort: false,
   debuggerAttached: new Set(), // tabId numbers
 };
+
+/** 为新任务组选一个颜色：优先用入参，否则按标题 hash + 时间戳打散 */
+function pickGroupColor(title = '', preferred) {
+  if (preferred && GROUP_COLORS.includes(preferred)) return preferred;
+  const s = `${title || 'task'}|${Date.now()}|${Math.random()}`;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return GROUP_COLORS[h % GROUP_COLORS.length];
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -100,27 +113,32 @@ async function listOpenTabs() {
   return out;
 }
 
-async function ensureTaskGroup(tabId, title) {
+async function ensureTaskGroup(tabId, title, preferredColor) {
   if (title) state.taskTitle = title;
   const tab = await chrome.tabs.get(tabId);
+  // 已在分组里：只更新标题，不覆盖用户/既有颜色
   if (tab.groupId != null && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
     state.taskGroupId = tab.groupId;
     try {
+      const existing = await chrome.tabGroups.get(tab.groupId);
+      state.taskGroupColor = existing?.color || state.taskGroupColor;
       await chrome.tabGroups.update(tab.groupId, {
         title: state.taskTitle,
-        color: 'blue',
         collapsed: false,
       });
     } catch {}
     return tab.groupId;
   }
+  // 新建分组：每次选不同颜色
+  const color = pickGroupColor(state.taskTitle, preferredColor || state.taskGroupColor);
   const groupId = await chrome.tabs.group({ tabIds: [tabId] });
   await chrome.tabGroups.update(groupId, {
     title: state.taskTitle,
-    color: 'blue',
+    color,
     collapsed: false,
   });
   state.taskGroupId = groupId;
+  state.taskGroupColor = color;
   return groupId;
 }
 
@@ -136,7 +154,11 @@ async function groupTabIfNeeded(tabId) {
   }
 }
 
-async function claimTab(tabId, title) {
+/**
+ * claim 默认不抢焦点（不 active、不 focus 窗口）。
+ * 仅当 params.focus === true 时才激活标签并前置 Chrome 窗口。
+ */
+async function claimTab(tabId, title, params = {}) {
   const id = Number(tabId);
   if (Number.isNaN(id)) throw new Error('invalid tabId');
   const tab = await chrome.tabs.get(id);
@@ -144,45 +166,62 @@ async function claimTab(tabId, title) {
   state.claimedTabId = id;
   state.rootTabId = id;
   state.taskActive = true;
-  const groupId = await ensureTaskGroup(id, title || state.taskTitle);
-  try {
-    await chrome.tabs.update(id, { active: true });
-    if (tab.windowId != null) {
-      await chrome.windows.update(tab.windowId, { focused: true });
-    }
-  } catch {}
+  const groupId = await ensureTaskGroup(id, title || state.taskTitle, params.color);
+  // 默认静默：只建组/接管，不把浏览器弹到前台
+  if (params.focus === true) {
+    try {
+      await chrome.tabs.update(id, { active: true });
+      if (tab.windowId != null) {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
+    } catch {}
+  }
   return {
     tabId: String(id),
     title: tab.title || '',
     url: tab.url || '',
     groupId,
+    groupColor: state.taskGroupColor,
     taskTitle: state.taskTitle,
   };
 }
 
-async function claimCurrentTab(title) {
+async function claimCurrentTab(title, params = {}) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) throw new Error('没有活动标签页');
-  return claimTab(String(tab.id), title);
+  return claimTab(String(tab.id), title, params);
 }
 
-async function startTask(title) {
+async function startTask(title, params = {}) {
   state.taskActive = true;
   if (title) state.taskTitle = title;
   let groupId = state.taskGroupId;
+
+  // 已 claim 的标签若已关闭，清掉后走新建逻辑
   if (state.claimedTabId != null) {
-    groupId = await ensureTaskGroup(state.claimedTabId, state.taskTitle);
+    try {
+      await chrome.tabs.get(state.claimedTabId);
+    } catch {
+      state.claimedTabId = null;
+      state.rootTabId = null;
+      state.taskGroupId = null;
+    }
+  }
+
+  if (state.claimedTabId != null) {
+    groupId = await ensureTaskGroup(state.claimedTabId, state.taskTitle, params.color);
   } else {
-    // create blank root tab for the task
-    const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+    // 后台开空白根标签，不抢用户当前标签
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
     state.claimedTabId = tab.id;
     state.rootTabId = tab.id;
-    groupId = await ensureTaskGroup(tab.id, state.taskTitle);
+    groupId = await ensureTaskGroup(tab.id, state.taskTitle, params.color);
   }
   return {
     taskActive: true,
     taskTitle: state.taskTitle,
     groupId,
+    groupColor: state.taskGroupColor,
     rootTabId: state.rootTabId != null ? String(state.rootTabId) : null,
   };
 }
@@ -208,7 +247,23 @@ async function endTask(closeGroup = false) {
     state.debuggerAttached.delete(tabId);
   }
   state.taskGroupId = null;
+  state.taskGroupColor = null;
+  state.claimedTabId = null;
+  state.rootTabId = null;
   return { ended: true, closedGroup: Boolean(closeGroup), previousGroupId: groupId };
+}
+
+/** 热重载扩展自身（加载磁盘上最新 background.js）。调用后 SW 会短暂离线再上线。 */
+async function reloadExtension() {
+  // 异步触发，先把结果回传再 reload
+  setTimeout(() => {
+    try {
+      chrome.runtime.reload();
+    } catch (e) {
+      console.warn('reloadExtension failed', e);
+    }
+  }, 200);
+  return { reloading: true };
 }
 
 async function resolveTabId(params = {}) {
@@ -221,7 +276,8 @@ async function resolveTabId(params = {}) {
 
 async function newTab(params = {}) {
   const url = params.url || 'about:blank';
-  const active = params.active !== false;
+  // 默认后台开页，只有显式 active:true 才切到该标签
+  const active = params.active === true;
   const tab = await chrome.tabs.create({ url, active });
   if (state.taskActive) {
     await groupTabIfNeeded(tab.id);
@@ -231,6 +287,7 @@ async function newTab(params = {}) {
     tabId: String(tab.id),
     url: tab.pendingUrl || tab.url || url,
     groupId: state.taskGroupId,
+    active,
   };
 }
 
@@ -238,7 +295,10 @@ async function goto(params = {}) {
   const tabId = await resolveTabId(params);
   const url = params.url;
   if (!url) throw new Error('missing url');
-  await chrome.tabs.update(tabId, { url, active: params.active !== false });
+  // 默认不改 active，避免后台导航时抢走用户正在看的标签
+  const update = { url };
+  if (params.active === true) update.active = true;
+  await chrome.tabs.update(tabId, update);
   // wait complete
   const timeout = params.timeoutMs || 30000;
   const start = Date.now();
@@ -548,15 +608,20 @@ async function ensureDebugger(tabId) {
 
 async function screenshot(params = {}) {
   const tabId = await resolveTabId(params);
-  // Prefer captureVisibleTab for simplicity (active window)
+  // captureVisibleTab 要求目标标签在所属窗口内是当前可见标签，
+  // 但绝不把 Chrome 窗口 focused 到前台（这是「一直弹浏览器」的主因）。
   const tab = await chrome.tabs.get(tabId);
   try {
-    await chrome.tabs.update(tabId, { active: true });
-    if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+    if (!tab.active) {
+      await chrome.tabs.update(tabId, { active: true });
+      await sleep(150);
+    }
+    // 仅当显式要求 focus 时才抢系统前台
+    if (params.focus === true && tab.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
   } catch {}
-  await sleep(150);
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-  // store via bridge? return base64 for CLI to save
   const base64 = (dataUrl || '').split(',')[1] || '';
   return {
     tabId: String(tabId),
@@ -635,13 +700,15 @@ async function handleCommand(cmd) {
     case 'openTabs':
       return { tabs: await listOpenTabs() };
     case 'claimTab':
-      return claimTab(params.tabId, params.title);
+      return claimTab(params.tabId, params.title, params);
     case 'claimCurrentTab':
-      return claimCurrentTab(params.title);
+      return claimCurrentTab(params.title, params);
     case 'startTask':
-      return startTask(params.title);
+      return startTask(params.title, params);
     case 'endTask':
       return endTask(Boolean(params.closeGroup));
+    case 'reloadExtension':
+      return reloadExtension();
     case 'setGroupTitle':
       if (state.taskGroupId == null) throw new Error('no task group');
       state.taskTitle = params.title || state.taskTitle;

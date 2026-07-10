@@ -55,6 +55,13 @@ sbc end-task
 2. 扩展离线时：先 `start-bridge.sh` + 确认扩展已加载，再重试
 3. 自动化页面必须进任务标签分组，减少干扰用户日常浏览
 4. 内网登录页：优先 `claim` 用户已登录标签，不要新开匿名页硬登
+5. **默认不抢浏览器焦点**：`claim` / `start-task` / `new-tab` / `goto` 均静默后台执行；只有显式 `--focus` / `--active` 才前置窗口。截图也不会 `windows.focus`。
+6. 新建任务标签分组颜色自动轮换（可 `start-task --color green` 指定）；复用已有分组不覆盖颜色
+
+## Agent 用法注意
+- 开页请用 `sbc new-tab --url ...`（默认后台），**不要**加 `--active` 除非用户要求看页面
+- 不要 `claim --focus`，除非用户明确说「切到这个标签」
+- 任务组颜色：省略则自动随机；需要固定色用 `--color`
 
 ## 故障排查
 ```bash

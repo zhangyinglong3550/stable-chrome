@@ -76,15 +76,24 @@ def cmd_open_tabs(_: argparse.Namespace) -> int:
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"title": args.title}
+    if getattr(args, "focus", False):
+        params["focus"] = True
+    if getattr(args, "color", None):
+        params["color"] = args.color
     if args.tab_id:
-        r = run_cmd("claimTab", {"tabId": args.tab_id, "title": args.title})
+        params["tabId"] = args.tab_id
+        r = run_cmd("claimTab", params)
     else:
-        r = run_cmd("claimCurrentTab", {"title": args.title})
+        r = run_cmd("claimCurrentTab", params)
     return out(r, 0 if r.get("ok") else 1)
 
 
 def cmd_start_task(args: argparse.Namespace) -> int:
-    r = run_cmd("startTask", {"title": args.title})
+    params: Dict[str, Any] = {"title": args.title}
+    if getattr(args, "color", None):
+        params["color"] = args.color
+    r = run_cmd("startTask", params)
     return out(r, 0 if r.get("ok") else 1)
 
 
@@ -93,8 +102,16 @@ def cmd_end_task(args: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
+def cmd_reload_extension(_: argparse.Namespace) -> int:
+    """热重载 Chrome 扩展（需扩展已加载含 reloadExtension 的版本；首次需在 chrome://extensions 点一次重新加载）。"""
+    r = run_cmd("reloadExtension", {}, timeout_ms=5000)
+    return out(r, 0 if r.get("ok") else 1)
+
+
 def cmd_new_tab(args: argparse.Namespace) -> int:
-    r = run_cmd("newTab", {"url": args.url, "active": not args.background})
+    # 默认后台开页（不抢焦点）；需要前台时用 --active
+    active = bool(getattr(args, "active", False))
+    r = run_cmd("newTab", {"url": args.url, "active": active})
     return out(r, 0 if r.get("ok") else 1)
 
 
@@ -245,22 +262,39 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="full diagnostics").set_defaults(func=cmd_doctor)
     sub.add_parser("open-tabs", help="list open tabs").set_defaults(func=cmd_open_tabs)
 
-    c = sub.add_parser("claim", help="claim tab (current if no --tab-id)")
+    c = sub.add_parser("claim", help="claim tab (current if no --tab-id); silent by default")
     c.add_argument("--tab-id")
     c.add_argument("--title", default="Claude Task")
+    c.add_argument(
+        "--color",
+        choices=["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan"],
+        help="tab group color (new group only; omit for auto)",
+    )
+    c.add_argument("--focus", action="store_true", help="activate tab and bring Chrome to front (default: off)")
     c.set_defaults(func=cmd_claim)
 
-    s = sub.add_parser("start-task", help="start task / ensure tab group")
+    s = sub.add_parser("start-task", help="start task / ensure tab group (background, no focus steal)")
     s.add_argument("--title", default="Claude Task")
+    s.add_argument(
+        "--color",
+        choices=["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan"],
+        help="tab group color (new group only; omit for auto)",
+    )
     s.set_defaults(func=cmd_start_task)
 
     e = sub.add_parser("end-task", help="end task")
     e.add_argument("--close-group", action="store_true")
     e.set_defaults(func=cmd_end_task)
 
-    n = sub.add_parser("new-tab", help="open new tab in task group")
+    sub.add_parser(
+        "reload-extension",
+        help="hot-reload the Chrome extension (picks up latest background.js)",
+    ).set_defaults(func=cmd_reload_extension)
+
+    n = sub.add_parser("new-tab", help="open new tab in task group (background by default)")
     n.add_argument("--url", default="about:blank")
-    n.add_argument("--background", action="store_true")
+    n.add_argument("--background", action="store_true", help="(default) open without activating")
+    n.add_argument("--active", action="store_true", help="activate the new tab (may interrupt user)")
     n.set_defaults(func=cmd_new_tab)
 
     g = sub.add_parser("goto", help="navigate")
