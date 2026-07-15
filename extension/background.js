@@ -794,14 +794,6 @@ chrome.runtime.onStartup.addListener(() => {
   console.log('[stable-chrome] startup');
 });
 
-chrome.tabs.onCreated.addListener(async (tab) => {
-  if (tab?.id != null) await groupTabIfNeeded(tab.id);
-});
-
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (changeInfo.status === 'complete') await groupTabIfNeeded(tabId);
-});
-
 // keep-alive alarm：每 15s 触发一次，唤醒 SW 并确保 pollLoop 在跑
 chrome.alarms.create('stable-chrome-keepalive', { periodInMinutes: 0.25 });
 chrome.alarms.onAlarm.addListener((alarm) => {
