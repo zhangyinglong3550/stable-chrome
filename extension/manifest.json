@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Stable Chrome Attach",
-  "version": "0.1.1",
-  "description": "Attach Claude/local agents to real Chrome tabs with task tab groups. No CDP 9222 required.",
+  "version": "0.1.5",
+  "description": "Attach agents to real Chrome tabs with task tab groups. CDP screenshot + optional agent window, no focus steal. No CDP 9222 required.",
   "permissions": [
     "tabs",
     "tabGroups",

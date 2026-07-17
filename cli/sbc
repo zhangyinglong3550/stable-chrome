@@ -75,12 +75,19 @@ def cmd_open_tabs(_: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
+DEFAULT_TASK_TITLE = "Agent Task"
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
-    params: Dict[str, Any] = {"title": args.title}
+    # title 缺省用 Agent Task；显式 --title 才覆盖
+    title = args.title if args.title is not None else DEFAULT_TASK_TITLE
+    params: Dict[str, Any] = {"title": title}
     if getattr(args, "focus", False):
         params["focus"] = True
     if getattr(args, "color", None):
         params["color"] = args.color
+    if getattr(args, "window", False):
+        params["window"] = True
     if args.tab_id:
         params["tabId"] = args.tab_id
         r = run_cmd("claimTab", params)
@@ -90,9 +97,18 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
 
 def cmd_start_task(args: argparse.Namespace) -> int:
-    params: Dict[str, Any] = {"title": args.title}
+    # 不传 --title 时：扩展侧保持已有任务名（或默认 Agent Task），避免反复改名
+    params: Dict[str, Any] = {}
+    if args.title is not None:
+        params["title"] = args.title
     if getattr(args, "color", None):
         params["color"] = args.color
+    # 默认独立窗口（不 focus）；只有显式 --same-window 才和用户同窗
+    if getattr(args, "same_window", False):
+        params["window"] = False
+    else:
+        # --window 是默认；保留 flag 兼容旧脚本显式传入
+        params["window"] = True
     r = run_cmd("startTask", params)
     return out(r, 0 if r.get("ok") else 1)
 
@@ -110,8 +126,20 @@ def cmd_reload_extension(_: argparse.Namespace) -> int:
 
 def cmd_new_tab(args: argparse.Namespace) -> int:
     # 默认后台开页（不抢焦点）；需要前台时用 --active
+    # 同任务默认永远单标签：有 claimed 则导航复用；--force 才强制新建
     active = bool(getattr(args, "active", False))
-    r = run_cmd("newTab", {"url": args.url, "active": active})
+    params: Dict[str, Any] = {"url": args.url, "active": active}
+    if getattr(args, "force", False):
+        params["force"] = True
+    r = run_cmd("newTab", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_close_tab(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("closeTab", params)
     return out(r, 0 if r.get("ok") else 1)
 
 
@@ -185,6 +213,8 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     params: Dict[str, Any] = {}
     if args.tab_id:
         params["tabId"] = args.tab_id
+    if getattr(args, "focus", False):
+        params["focus"] = True
     r = run_cmd("screenshot", params, timeout_ms=30000)
     if not r.get("ok"):
         return out(r, 1)
@@ -193,7 +223,16 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     out_path = Path(args.out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(base64.b64decode(b64))
-    return out({"ok": True, "path": str(out_path), "tabId": result.get("tabId")}, 0)
+    return out(
+        {
+            "ok": True,
+            "path": str(out_path),
+            "tabId": result.get("tabId"),
+            "method": result.get("method"),
+            "restoredActiveTabId": result.get("restoredActiveTabId"),
+        },
+        0,
+    )
 
 
 def cmd_reload(args: argparse.Namespace) -> int:
@@ -264,21 +303,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("claim", help="claim tab (current if no --tab-id); silent by default")
     c.add_argument("--tab-id")
-    c.add_argument("--title", default="Claude Task")
+    c.add_argument("--title", default=None, help=f"task group title (default: {DEFAULT_TASK_TITLE})")
     c.add_argument(
         "--color",
         choices=["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan"],
         help="tab group color (new group only; omit for auto)",
     )
     c.add_argument("--focus", action="store_true", help="activate tab and bring Chrome to front (default: off)")
+    c.add_argument(
+        "--window",
+        action="store_true",
+        help="move claimed tab into a separate unfocused window (do not steal focus)",
+    )
     c.set_defaults(func=cmd_claim)
 
-    s = sub.add_parser("start-task", help="start task / ensure tab group (background, no focus steal)")
-    s.add_argument("--title", default="Claude Task")
+    s = sub.add_parser("start-task", help="start/reuse task tab group (background, no focus steal)")
+    s.add_argument(
+        "--title",
+        default=None,
+        help=f"task group title; omit to keep existing name (new task default: {DEFAULT_TASK_TITLE})",
+    )
     s.add_argument(
         "--color",
         choices=["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan"],
         help="tab group color (new group only; omit for auto)",
+    )
+    s.add_argument(
+        "--window",
+        action="store_true",
+        default=True,
+        help="use a dedicated unfocused Chrome window (default: on)",
+    )
+    s.add_argument(
+        "--same-window",
+        action="store_true",
+        help="keep agent tabs in the current Chrome window (disables --window)",
     )
     s.set_defaults(func=cmd_start_task)
 
@@ -291,11 +350,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="hot-reload the Chrome extension (picks up latest background.js)",
     ).set_defaults(func=cmd_reload_extension)
 
-    n = sub.add_parser("new-tab", help="open new tab in task group (background by default)")
+    n = sub.add_parser(
+        "new-tab",
+        help="open or navigate task tab (single-tab by default, background)",
+    )
     n.add_argument("--url", default="about:blank")
     n.add_argument("--background", action="store_true", help="(default) open without activating")
     n.add_argument("--active", action="store_true", help="activate the new tab (may interrupt user)")
+    n.add_argument(
+        "--force",
+        action="store_true",
+        help="force create a second tab (default: always reuse the single claimed tab)",
+    )
     n.set_defaults(func=cmd_new_tab)
+
+    ct = sub.add_parser("close-tab", help="close a tab by id (or current claimed tab)")
+    ct.add_argument("--tab-id")
+    ct.set_defaults(func=cmd_close_tab)
 
     g = sub.add_parser("goto", help="navigate")
     g.add_argument("url")
@@ -338,9 +409,17 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--timeout-ms", type=int, default=15000)
     w.set_defaults(func=cmd_wait)
 
-    sc = sub.add_parser("screenshot", help="screenshot active tab")
+    sc = sub.add_parser(
+        "screenshot",
+        help="screenshot tab via CDP (no tab switch); falls back to captureVisibleTab",
+    )
     sc.add_argument("--out", default=str(Path.home() / "file/codex/sbc-screenshot.png"))
     sc.add_argument("--tab-id")
+    sc.add_argument(
+        "--focus",
+        action="store_true",
+        help="bring Chrome window to front (default: off; not needed for CDP screenshot)",
+    )
     sc.set_defaults(func=cmd_screenshot)
 
     rl = sub.add_parser("reload", help="reload tab")
