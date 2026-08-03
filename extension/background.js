@@ -978,6 +978,67 @@ async function fill(params = {}) {
   return { tabId: String(tabId), ok: true, selector, value: String(value) };
 }
 
+
+async function typeText(params = {}) {
+  const tabId = await resolveTabId(params);
+  const text = params.text ?? params.value ?? '';
+  if (!text && !params.ctrlKey) throw new Error('typeText requires text');
+  await ensureDebugger(tabId);
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+      expression: "(() => { const ta=document.querySelector('textarea.xterm-helper-textarea'); if(ta){ ta.focus(); } return !!ta; })()",
+    });
+  } catch {}
+  // Ctrl+C special
+  if (params.ctrlKey && (params.key === 'c' || params.key === 'C' || text === '\u0003' || text === '\x03')) {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyDown', modifiers: 2, windowsVirtualKeyCode: 67, code: 'KeyC', key: 'c',
+    });
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyUp', modifiers: 2, windowsVirtualKeyCode: 67, code: 'KeyC', key: 'c',
+    });
+    return { tabId: String(tabId), ok: true, ctrlC: true };
+  }
+  const s = String(text || '');
+  // Prefer insertText first (fast path)
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text: s });
+  } catch {
+    for (const ch of s) {
+      if (ch === '\n') {
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter',
+        });
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+          type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter',
+        });
+      } else {
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', text: ch, unmodifiedText: ch, key: ch,
+        });
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+          type: 'char', text: ch, unmodifiedText: ch, key: ch,
+        });
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+          type: 'keyUp', key: ch,
+        });
+      }
+    }
+  }
+  if (params.enter === true || params.submit === true) {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyDown', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: 'Enter', code: 'Enter', text: '\r',
+    });
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'char', windowsVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r',
+    });
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyUp', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: 'Enter', code: 'Enter',
+    });
+  }
+  return { tabId: String(tabId), ok: true, len: s.length };
+}
+
 async function press(params = {}) {
   const tabId = await resolveTabId(params);
   const key = params.key || 'Enter';
@@ -1264,6 +1325,8 @@ async function handleCommand(cmd) {
       return fill(params);
     case 'press':
       return press(params);
+    case 'typeText':
+      return typeText(params);
     case 'waitFor':
       return waitFor(params);
     case 'content':
