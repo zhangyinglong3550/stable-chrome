@@ -1,18 +1,33 @@
 ---
 name: stable-chrome
-description: 稳定附着用户真实 Chrome（不依赖 9222），支持 openTabs/claim/任务标签分组/DOM 操作。用于需要登录态的内网页面自动化、部署、联调。Use when user asks to control real Chrome, reuse login session, open tab groups, or when CDP/9222 connection fails.
+description: 稳定附着用户真实 Chrome（不依赖 9222），支持 openTabs/claim/任务标签分组/DOM 操作。用户要安装/setup/加载扩展、或控制真实 Chrome / 复用登录态 / 9222 失败时：先在仓库根目录运行 python3 cli/sbc setup（Windows: python cli\sbc setup），再让用户加载 extension/。
 ---
 
 # stable-chrome
 
-独立于 Codex 的真实 Chrome 附着能力。
+独立于 Codex 的真实 Chrome 附着能力。任意 Agent 都走同一条安装命令，不限于 Claude Code。
 
 ## 架构一句话
 CLI/Agent → 本地 Bridge(`http://127.0.0.1:19527`) → Chrome 扩展 poll 命令 → 在真实标签上执行。
 
+## 安装（Agent 先做这个）
+在仓库根目录执行（用户不用自己跑脚本）：
+
+```bash
+python3 cli/sbc setup          # Windows: python cli\sbc setup
+```
+
+`setup` 会拷 skill、起 Bridge、打开 `chrome://extensions`。Chrome **禁止**静默安装未打包扩展，所以还要请用户：开发者模式 → 加载已解压 → 输出里的 `extensionDir`。然后：
+
+```bash
+python3 cli/sbc doctor         # Windows: python cli\sbc doctor
+```
+
+`extension.online=true` 再继续操作。不要让用户执行 `install.sh`。
+
 ## 前置
-1. Bridge 运行：`~/code/stable-chrome/scripts/start-bridge.sh`
-2. Chrome 已加载解压扩展：`~/code/stable-chrome/extension`
+1. 已跑过 `sbc setup`（或 Bridge 已在 `http://127.0.0.1:19527`）
+2. Chrome 已加载仓库内 `extension/` 目录
 3. `sbc doctor` 显示 `extension.online=true`
 
 ## 推荐工作流
@@ -35,6 +50,7 @@ sbc end-task
 ## 命令速查
 | 命令 | 作用 |
 |---|---|
+| `sbc setup` | 装 skill、起 Bridge、打开扩展页（任意 Agent 的安装入口） |
 | `sbc health` | bridge 健康 |
 | `sbc doctor` | 扩展是否在线 |
 | `sbc open-tabs` | 列出真实标签 |
@@ -57,7 +73,7 @@ sbc end-task
 
 ## 硬规则
 1. **禁止**默认使用 9222 / 复制 profile / 匿名 Chromium 冒充连接成功
-2. 扩展离线时：先 `start-bridge.sh` + 确认扩展已加载，再重试
+2. 扩展离线时：先 `sbc setup`（或确认 Bridge + 扩展已加载），再重试
 3. 自动化页面必须进任务标签分组，减少干扰用户日常浏览
 4. 内网登录页：优先 `claim` 用户已登录标签，不要新开匿名页硬登
 5. **默认不抢浏览器焦点**：`claim` / `start-task` / `new-tab` / `goto` 均静默后台执行；只有显式 `--focus` / `--active` 才前置窗口。
@@ -85,11 +101,13 @@ sbc doctor
 # 看 extension.online / hints
 # 扩展 service worker 控制台应持续请求 /ext/poll
 # 改完 extension 后：sbc reload-extension（或 chrome://extensions 点重新加载）
+# 未安装：python3 cli/sbc setup
 ```
 
 ## 实现路径
 安装后在仓库根目录找到对应文件：
-- CLI：`cli/sbc`（建议加入 PATH）
+- 安装入口：`python3 cli/sbc setup`（Windows：`python cli\sbc setup`）
+- CLI：`cli/sbc`
 - Bridge：`bridge/server.py`
 - Chrome 扩展：`extension/`
-- 启动脚本：`scripts/start-bridge.sh`
+- Agent 入口：`AGENTS.md`

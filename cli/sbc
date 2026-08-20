@@ -10,13 +10,23 @@ import argparse
 import base64
 import json
 import os
+import shutil
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 DEFAULT_BRIDGE = os.getenv("STABLE_CHROME_BRIDGE", "http://127.0.0.1:19527")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SKILL_DIR_NAMES = (
+    Path(".claude") / "skills" / "stable-chrome",
+    Path(".cursor") / "skills" / "stable-chrome",
+    Path(".codex") / "skills" / "stable-chrome",
+    Path(".agents") / "skills" / "stable-chrome",
+)
 
 
 def http_json(method: str, path: str, body: Optional[dict] = None, timeout: float = 30.0) -> dict:
@@ -50,6 +60,203 @@ def out(data: Any, code: int = 0) -> int:
     else:
         print(data)
     return code
+
+
+def default_skill_dirs(home: Optional[Path] = None) -> List[Path]:
+    root = home or Path.home()
+    return [root / p for p in SKILL_DIR_NAMES]
+
+
+def ensure_icons(icon_dir: Path) -> Path:
+    """生成纯色 PNG 图标（无第三方依赖）。已存在则跳过。"""
+    import binascii
+    import struct
+    import zlib
+
+    icon_dir.mkdir(parents=True, exist_ok=True)
+
+    def png(size: int, rgb=(15, 143, 140)) -> bytes:
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + tag
+                + data
+                + struct.pack(">I", binascii.crc32(tag + data) & 0xFFFFFFFF)
+            )
+
+        raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b"")
+        )
+
+    for size in (16, 48, 128):
+        path = icon_dir / f"icon{size}.png"
+        if not path.exists() or path.stat().st_size == 0:
+            path.write_bytes(png(size))
+    return icon_dir
+
+
+def install_skills(skill_src: Path, dests: List[Path], config: dict) -> List[str]:
+    written: List[str] = []
+    for dest in dests:
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_src, dest / "SKILL.md")
+        (dest / "config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        written.append(str(dest))
+    return written
+
+
+def link_cli(cli_path: Path) -> Optional[str]:
+    if os.name == "nt":
+        return None
+    bindir = Path.home() / ".local" / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    dest = bindir / "sbc"
+    try:
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        dest.symlink_to(cli_path)
+        mode = cli_path.stat().st_mode
+        cli_path.chmod(mode | 0o111)
+        return str(dest)
+    except OSError:
+        return None
+
+
+def start_bridge_if_needed(root: Path) -> dict:
+    if http_json("GET", "/health", timeout=2).get("ok"):
+        return {"ok": True, "already": True, "url": DEFAULT_BRIDGE}
+    log_dir = Path(os.getenv("STABLE_CHROME_LOG_DIR", str(root / "logs")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_f = open(log_dir / "bridge.out", "ab")
+    kwargs: Dict[str, Any] = {
+        "stdout": out_f,
+        "stderr": subprocess.STDOUT,
+        "cwd": str(root),
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen([sys.executable, str(root / "bridge" / "server.py")], **kwargs)
+    (log_dir / "bridge.pid").write_text(str(proc.pid), encoding="utf-8")
+    for _ in range(15):
+        time.sleep(0.2)
+        if http_json("GET", "/health", timeout=1).get("ok"):
+            return {"ok": True, "already": False, "pid": proc.pid, "url": DEFAULT_BRIDGE}
+    return {
+        "ok": False,
+        "pid": proc.pid,
+        "url": DEFAULT_BRIDGE,
+        "error": f"bridge 未起来，看 {log_dir / 'bridge.out'}",
+    }
+
+
+def _chrome_bin() -> Optional[str]:
+    if sys.platform == "darwin":
+        mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        return mac if os.path.isfile(mac) else None
+    if os.name == "nt":
+        candidates = [
+            os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
+        ]
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+        return shutil.which("chrome") or shutil.which("chrome.exe")
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def open_install_ui(extension_dir: Path) -> dict:
+    opened: Dict[str, bool] = {"extensionsPage": False, "extensionDir": False}
+    chrome = _chrome_bin()
+    try:
+        if chrome:
+            subprocess.Popen([chrome, "chrome://extensions/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened["extensionsPage"] = True
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Google Chrome", "chrome://extensions/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened["extensionsPage"] = True
+    except OSError:
+        pass
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(extension_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif os.name == "nt":
+            subprocess.Popen(["explorer", str(extension_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(extension_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        opened["extensionDir"] = True
+    except OSError:
+        pass
+    return opened
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    root = REPO_ROOT
+    ext_dir = (root / "extension").resolve()
+    skill_src = root / "skill" / "SKILL.md"
+    if not skill_src.is_file() or not (ext_dir / "manifest.json").is_file():
+        return out({"ok": False, "error": f"不像 stable-chrome 仓库根: {root}"}, 1)
+
+    ensure_icons(ext_dir / "icons")
+    config = {
+        "root": str(root),
+        "bridge": DEFAULT_BRIDGE,
+        "cli": str(root / "cli" / "sbc"),
+        "extension": str(ext_dir),
+    }
+    skills = install_skills(skill_src, default_skill_dirs(), config)
+    linked = link_cli(root / "cli" / "sbc")
+
+    bridge = {"ok": True, "skipped": True, "url": DEFAULT_BRIDGE}
+    if not getattr(args, "no_bridge", False):
+        bridge = start_bridge_if_needed(root)
+
+    doctor = http_json("GET", "/doctor", timeout=3) if bridge.get("ok") else {}
+    online = bool((doctor.get("extension") or {}).get("online"))
+
+    opened = {"extensionsPage": False, "extensionDir": False}
+    if not getattr(args, "no_open", False) and not online:
+        opened = open_install_ui(ext_dir)
+
+    if online:
+        user_action = "已就绪：扩展在线，无需再加载。"
+    else:
+        user_action = (
+            "请在 Chrome 扩展页打开「开发者模式」，点「加载已解压的扩展程序」，"
+            f"选择这个目录：{ext_dir}"
+        )
+
+    payload = {
+        "ok": bool(bridge.get("ok")),
+        "root": str(root),
+        "extensionDir": str(ext_dir),
+        "cli": str(root / "cli" / "sbc"),
+        "cliLink": linked,
+        "skills": skills,
+        "bridge": bridge,
+        "extensionOnline": online,
+        "opened": opened,
+        "userAction": user_action,
+        "next": "python3 cli/sbc doctor" if os.name != "nt" else r"python cli\sbc doctor",
+    }
+    return out(payload, 0 if payload["ok"] else 1)
 
 
 def cmd_health(_: argparse.Namespace) -> int:
@@ -299,6 +506,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("health", help="bridge health").set_defaults(func=cmd_health)
     sub.add_parser("doctor", help="full diagnostics").set_defaults(func=cmd_doctor)
+    setup_p = sub.add_parser(
+        "setup",
+        help="install skill + start bridge + open Chrome extension page (any agent)",
+    )
+    setup_p.add_argument("--no-open", action="store_true", help="不要打开 Chrome / 资源管理器")
+    setup_p.add_argument("--no-bridge", action="store_true", help="不要启动 Bridge")
+    setup_p.set_defaults(func=cmd_setup)
     sub.add_parser("open-tabs", help="list open tabs").set_defaults(func=cmd_open_tabs)
 
     c = sub.add_parser("claim", help="claim tab (current if no --tab-id); silent by default")

@@ -6,6 +6,8 @@
 
 中文 | [English](#english)
 
+**任意 Agent 安装（一句话）：** 在仓库根目录执行 `python3 cli/sbc setup`（Windows：`python cli\sbc setup`），然后请用户在打开的 Chrome 扩展页开启开发者模式，加载已解压扩展（目录见输出 `extensionDir`）。
+
 ---
 
 ## 工作原理
@@ -40,104 +42,26 @@ Chrome 扩展（MV3）
 
 ## 快速开始
 
-前置：Python 3.8+、Google Chrome。macOS / Linux 可直接跑仓库里的 `.sh`；Windows 用下方 PowerShell 步骤（已装 Git Bash / WSL 的也可走 macOS / Linux 流程）。
-
-### macOS / Linux
+前置：Python 3.8+、Google Chrome。人机同一条命令：
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/stable-chrome.git
-cd stable-chrome
-./scripts/install.sh          # 检查 Python 3.8+，生成扩展图标，把 sbc 链到 PATH
+python3 cli/sbc setup          # Windows: python cli\sbc setup
+```
 
+`setup` 会生成图标、把 skill 拷到常见 Agent 目录（Claude / Cursor / Codex / 通用 `.agents`）、启动 Bridge、打开 `chrome://extensions`。Chrome 不允许脚本静默安装未打包扩展，所以最后请用户：**开发者模式 → 加载已解压 → 输出里的 `extensionDir`**。然后 `python3 cli/sbc doctor`，`extension.online` 应为 `true`。
+
+环境变量可覆盖：`STABLE_CHROME_PORT`、`STABLE_CHROME_HOST`。停止 Bridge：`./scripts/stop-bridge.sh`（Windows 关掉 `setup` 拉起的 Python 进程，或结束 19527 端口）。
+
+macOS / Linux 也可以 `./scripts/install.sh`，它只是 `sbc setup` 的包装。Windows 不要跑 `.sh`，直接 `python cli\sbc setup`。
+
+想少打字（当前会话）：
+
+```bash
+# macOS / Linux
 export PATH="$PATH:$(pwd)/cli"
-# 或
-ln -s "$(pwd)/cli/sbc" /usr/local/bin/sbc
-```
 
-Chrome 加载扩展：
-
-1. 打开 `chrome://extensions/`
-2. 打开右上角 **开发者模式**
-3. **加载已解压的扩展程序** → 选仓库里的 `extension/`
-4. 记下扩展 ID
-
-启动 Bridge 并自检：
-
-```bash
-./scripts/start-bridge.sh     # 默认 http://127.0.0.1:19527
-sbc doctor                    # extension.online 应为 true
-```
-
-环境变量可覆盖：`STABLE_CHROME_PORT`、`STABLE_CHROME_HOST`。停止：`./scripts/stop-bridge.sh`。
-
-### Windows
-
-Windows 没有 `chmod` / `nohup` / `lsof`，不要跑 `scripts/*.sh`（除非在 Git Bash 或 WSL 里）。Bridge 和 CLI 都是纯 Python，用系统 Python 即可。
-
-1. 安装 [Python 3.8+](https://www.python.org/downloads/windows/)，勾选 **Add python.exe to PATH**。确认：
-
-   ```powershell
-   python --version
-   ```
-
-2. 克隆仓库（PowerShell）：
-
-   ```powershell
-   git clone https://github.com/YOUR_USERNAME/stable-chrome.git
-   cd stable-chrome
-   ```
-
-3. Chrome 加载扩展（与 macOS 相同）：`chrome://extensions/` → **开发者模式** → **加载已解压的扩展程序** → 选本仓库的 `extension` 文件夹。工具栏图标缺失可忽略（Chrome 用默认图标）；若要生成图标，在 Git Bash 里跑一次 `./scripts/install.sh`。
-
-4. 开一个终端前台跑 Bridge（关掉这个窗口等于停服务）：
-
-   ```powershell
-   python bridge\server.py
-   ```
-
-   默认监听 `http://127.0.0.1:19527`。换端口：
-
-   ```powershell
-   $env:STABLE_CHROME_PORT = "19527"
-   $env:STABLE_CHROME_HOST = "127.0.0.1"
-   python bridge\server.py
-   ```
-
-   需要后台跑时，另开一个最小化窗口即可，不要关。端口被占用时：
-
-   ```powershell
-   Get-NetTCPConnection -LocalPort 19527 -ErrorAction SilentlyContinue |
-     Select-Object OwningProcess
-   Stop-Process -Id <PID> -Force
-   ```
-
-5. **另开一个** PowerShell，用 Python 调 CLI（Windows 不会执行 `cli\sbc` 的 shebang，必须显式 `python`）：
-
-   ```powershell
-   python cli\sbc doctor
-   ```
-
-   `extension.online` 应为 `true`。之后所有命令都是同一形式：
-
-   ```powershell
-   python cli\sbc health
-   python cli\sbc open-tabs
-   python cli\sbc start-task --title "deploy-prod"
-   python cli\sbc new-tab --url "https://example.com"
-   ```
-
-   想少打字，可在当前会话加函数：
-
-   ```powershell
-   function sbc { python "$PWD\cli\sbc" @args }
-   sbc doctor
-   ```
-
-把 Skill 拷到 Claude Code（Windows）：
-
-```powershell
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\skills\stable-chrome" | Out-Null
-Copy-Item skill\SKILL.md "$env:USERPROFILE\.claude\skills\stable-chrome\SKILL.md"
+# Windows PowerShell
+function sbc { python "$PWD\cli\sbc" @args }
 ```
 
 ---
@@ -146,6 +70,7 @@ Copy-Item skill\SKILL.md "$env:USERPROFILE\.claude\skills\stable-chrome\SKILL.md
 
 | 命令 | 作用 |
 |---|---|
+| `sbc setup` | 装 skill、起 Bridge、打开扩展页 |
 | `sbc health` | Bridge 是否存活 |
 | `sbc doctor` | 完整诊断（Bridge + 扩展） |
 | `sbc open-tabs` | 列出真实 Chrome 标签 |
@@ -171,18 +96,16 @@ Windows 把上表里的 `sbc` 换成 `python cli\sbc`。
 
 ---
 
-## 作为 Claude Code Skill 使用
+## 作为任意 Agent 的 Skill
 
-把 `skill/SKILL.md` 拷到（或软链到）`~/.claude/skills/stable-chrome/`：
+`sbc setup` 会把 `skill/SKILL.md` 拷到：
 
-```bash
-mkdir -p ~/.claude/skills/stable-chrome
-cp skill/SKILL.md ~/.claude/skills/stable-chrome/SKILL.md
-```
+- `~/.claude/skills/stable-chrome/`
+- `~/.cursor/skills/stable-chrome/`
+- `~/.codex/skills/stable-chrome/`
+- `~/.agents/skills/stable-chrome/`
 
-Windows 见上方 PowerShell 拷贝命令。之后对 Claude 说：
-
-> 「用 stable-chrome 打开部署页面并点击发布」
+仓库根还有 `AGENTS.md`：打开本项目的 Agent 不装 skill 也能看到那句安装命令。之后对 Agent 说「用 stable-chrome 打开部署页面并点击发布」即可。
 
 ---
 
@@ -226,17 +149,13 @@ Windows PowerShell 设置环境变量：`$env:STABLE_CHROME_PORT = "19527"`。
 Chrome 会挂起 MV3 Service Worker。内置 alarm 每 15 秒唤醒一次。若仍离线，到 `chrome://extensions/` 点重新加载。
 
 **连不上 Bridge**  
-macOS / Linux：跑 `./scripts/start-bridge.sh`，再 `sbc health`。  
-Windows：确认 `python bridge\server.py` 那个窗口还在，再 `python cli\sbc health`。
+跑 `python3 cli/sbc setup`（或 `./scripts/start-bridge.sh`），再 `sbc health`。Windows：`python cli\sbc setup`。
 
 **命令超时**  
 扩展可能在执行中途被挂起。先 `sbc doctor`（Windows：`python cli\sbc doctor`），离线则重载扩展再试。
 
 **Windows 提示找不到 `sbc`**  
-这是正常的：`cli\sbc` 没有 `.exe`。请用 `python cli\sbc ...`。
-
-**Windows 扩展加载后没有自定义图标**  
-可忽略。或在 Git Bash / WSL 里跑 `./scripts/install.sh` 生成 `extension/icons/`，再重载扩展。
+这是正常的：`cli\sbc` 没有 `.exe`。请用 `python cli\sbc ...`。`setup` 不会在 Windows 上做 PATH 软链。
 
 ---
 
@@ -261,35 +180,21 @@ Attach Claude / AI agents to your **real Chrome browser** — reusing login sess
 
 The Chinese section above is the canonical docs. This is a short English recap.
 
+**Any-agent install:** from the repo root run `python3 cli/sbc setup` (Windows: `python cli\sbc setup`). Ask the user to enable Developer mode and Load unpacked using `extensionDir` from the output. Then `doctor` until `extension.online` is true. Never use `--remote-debugging-port=9222`.
+
 ### How it works
 
 CLI/Skill → local Bridge (`http://127.0.0.1:19527`) → Chrome MV3 extension long-poll → real tabs. No CDP port, no profile copy, no headless browser.
 
-### macOS / Linux
+### macOS / Linux / Windows
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/stable-chrome.git
 cd stable-chrome
-./scripts/install.sh
-export PATH="$PATH:$(pwd)/cli"
-# Chrome: chrome://extensions → Developer mode → Load unpacked → extension/
-./scripts/start-bridge.sh
-sbc doctor
+python3 cli/sbc setup          # Windows: python cli\sbc setup
 ```
 
-### Windows
-
-Do **not** run `scripts/*.sh` in cmd/PowerShell (Git Bash / WSL is fine). Use Python 3.8+:
-
-```powershell
-git clone https://github.com/YOUR_USERNAME/stable-chrome.git
-cd stable-chrome
-python bridge\server.py          # keep this window open
-# another terminal:
-python cli\sbc doctor
-```
-
-Load unpacked extension from `extension\`. Generate icons first if they are missing (see the Chinese Windows section). Prefix every CLI call with `python cli\sbc` — the shebang in `cli\sbc` is ignored on Windows.
+Load unpacked from `extensionDir`. Then `python3 cli/sbc doctor`.
 
 ### CLI / config / troubleshooting
 
