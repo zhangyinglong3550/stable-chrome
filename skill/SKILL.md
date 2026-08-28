@@ -35,7 +35,7 @@ python3 cli/sbc doctor         # Windows: python cli\sbc doctor
 sbc doctor
 sbc open-tabs
 # 同会话只 start-task 一次；默认独立后台窗口，不和用户抢同一窗
-sbc start-task --title "deploy-core"
+sbc start-task --title "部署任务"
 sbc new-tab --url "https://example.com"   # 同任务默认永远单标签（后台）
 sbc new-tab --url "https://example.com/next"  # 再次调用 = 同标签导航，不新开
 # 等价写法：sbc goto "https://example.com/next"
@@ -91,7 +91,7 @@ sbc end-task
 - 开页请用 `sbc new-tab --url ...`（默认后台），**不要**加 `--active` 除非用户要求看页面
 - 不要 `claim --focus`，除非用户明确说「切到这个标签」
 - **不要 claim 用户正在工作的标签**，除非用户明确要求接管；优先 `start-task` + `new-tab`
-- 任务组标题默认 `Agent Task`；需要语义化时传 `--title "deploy-core"` 等
+- 任务组标题默认 `Agent 任务`；需要语义化时传 `--title "部署任务"` 等
 - 任务组颜色：省略则自动随机；需要固定色用 `--color`
 - 截图结果里 `method: "debugger"` 表示无焦点干扰；若落到 `captureVisibleTab` 才可能闪一下
 

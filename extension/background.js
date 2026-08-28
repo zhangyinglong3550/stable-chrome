@@ -6,7 +6,7 @@
 const BRIDGE = 'http://127.0.0.1:19527';
 const POLL_WAIT_MS = 25000;
 const HELLO_EVERY_MS = 5000;
-const DEFAULT_TASK_TITLE = 'Agent Task';
+const DEFAULT_TASK_TITLE = 'Agent 任务';
 const STATE_STORAGE_KEY = 'stableChromeTaskState';
 
 // SW 被 Chrome 挂起后，上下文重置，pollLoop 会停掉。
@@ -453,7 +453,7 @@ async function claimCurrentTab(title, params = {}) {
 async function startTask(title, params = {}) {
   await reconcileTaskState();
   state.taskActive = true;
-  // 仅当调用方显式传入 title 时才改名；缺省保持已有任务名 / 默认 Agent Task
+  // 仅当调用方显式传入 title 时才改名；缺省保持已有任务名 / 默认 Agent 任务
   if (title) state.taskTitle = title;
   // 允许调用方预置颜色（等第一次 new-tab/claim 建组时用）
   if (params.color && GROUP_COLORS.includes(params.color)) {

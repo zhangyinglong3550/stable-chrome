@@ -282,11 +282,11 @@ def cmd_open_tabs(_: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
-DEFAULT_TASK_TITLE = "Agent Task"
+DEFAULT_TASK_TITLE = "Agent 任务"
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
-    # title 缺省用 Agent Task；显式 --title 才覆盖
+    # title 缺省用 Agent 任务；显式 --title 才覆盖
     title = args.title if args.title is not None else DEFAULT_TASK_TITLE
     params: Dict[str, Any] = {"title": title}
     if getattr(args, "focus", False):
@@ -304,7 +304,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
 
 def cmd_start_task(args: argparse.Namespace) -> int:
-    # 不传 --title 时：扩展侧保持已有任务名（或默认 Agent Task），避免反复改名
+    # 不传 --title 时：扩展侧保持已有任务名（或默认 Agent 任务），避免反复改名
     params: Dict[str, Any] = {}
     if args.title is not None:
         params["title"] = args.title

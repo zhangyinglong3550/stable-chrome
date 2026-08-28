@@ -9,11 +9,11 @@ CLI = Path(__file__).parents[1] / "cli" / "sbc"
 def test_default_title_is_agent_task_not_claude():
     source = BACKGROUND.read_text()
     cli = CLI.read_text()
-    assert "DEFAULT_TASK_TITLE = 'Agent Task'" in source or 'DEFAULT_TASK_TITLE = "Agent Task"' in source
+    assert "DEFAULT_TASK_TITLE = 'Agent 任务'" in source or 'DEFAULT_TASK_TITLE = "Agent 任务"' in source
     # 运行时默认名不得再是 Claude Task（注释里可提旧名）
     assert "taskTitle: 'Claude Task'" not in source
     assert 'taskTitle: "Claude Task"' not in source
-    assert 'DEFAULT_TASK_TITLE = "Agent Task"' in cli
+    assert 'DEFAULT_TASK_TITLE = "Agent 任务"' in cli
     assert 'default="Claude Task"' not in cli
 
 
