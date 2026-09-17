@@ -1274,6 +1274,45 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * 读 cookie（含 HttpOnly）。
+ *
+ * 走 debugger 已有的 CDP 能力（Network.getCookies），因此**不需要 manifest 的 cookies 权限**，
+ * 也就不会触发 Chrome 的权限变更重新授权。这是"复用用户已登录会话"取凭证的通用手段：
+ * 普通 JS 的 document.cookie 看不到 HttpOnly，而 DevTools 能看到正是因为 DevTools 走 CDP。
+ *
+ * params: { name?, url?, tabId? }  —— 不给 url 时用目标标签当前地址。
+ * 返回 cookies 明细；调用方负责不要把 value 打进日志。
+ */
+async function cookieGet(params = {}) {
+  const tabId = await resolveTabId(params);
+  let url = params.url;
+  if (!url) {
+    const tab = await chrome.tabs.get(tabId);
+    url = tab?.url || '';
+  }
+  if (!url || !/^https?:/i.test(url)) {
+    throw new Error(`cookieGet 需要一个 http(s) url（当前：${url || '空'}）`);
+  }
+  await ensureDebugger(tabId);
+  const res = await chrome.debugger.sendCommand({ tabId }, 'Network.getCookies', { urls: [url] });
+  const all = res?.cookies || [];
+  const picked = params.name ? all.filter((c) => c.name === params.name) : all;
+  return {
+    tabId: String(tabId),
+    url,
+    count: picked.length,
+    cookies: picked.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      httpOnly: !!c.httpOnly,
+      secure: !!c.secure,
+    })),
+  };
+}
+
 async function handleCommand(cmd) {
   await ensureStateReady();
   const type = cmd?.type;
@@ -1317,6 +1356,8 @@ async function handleCommand(cmd) {
       return reload(params);
     case 'eval':
       return evalCmd(params);
+    case 'cookieGet':
+      return cookieGet(params);
     case 'snapshot':
       return snapshot(params);
     case 'click':

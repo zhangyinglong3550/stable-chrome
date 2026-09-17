@@ -91,8 +91,14 @@ function sbc { python "$PWD\cli\sbc" @args }
 | `sbc net-start [--tab-id ID]` | 开始 CDP 网络捕获 |
 | `sbc net-get [--grep STR]` | 读取已捕获请求（不停止） |
 | `sbc net-stop [--grep STR]` | 停止捕获并打印全部请求 |
+| `sbc cookie-get [--name NAME] [--url URL] [--tab-id ID]` | 读 cookie（**含 HttpOnly**）；输出**含明文值**，别粘进日志/对话 |
 
 Windows 把上表里的 `sbc` 换成 `python cli\sbc`。
+
+> `cookie-get` 走 CDP `Network.getCookies`，复用扩展已有的 `debugger` 权限，
+> **不需要 manifest 增加 `cookies` 权限**（避免触发 Chrome 权限变更重新授权）。
+> 用途：内网控制台凭证基本都是登录态 cookie，`document.cookie` 读不到 HttpOnly，
+> 而 DevTools 能读正是因为它走 CDP——扩展现在具备同样的能力。
 
 ---
 

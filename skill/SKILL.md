@@ -64,6 +64,7 @@ sbc end-task
 | `sbc eval 'document.title'` | 执行 JS |
 | `sbc snapshot` | 可见可交互元素 |
 | `sbc content` | 读正文摘要 |
+| `sbc cookie-get [--name NAME] [--url URL]` | 读 cookie（**含 HttpOnly**，走 CDP，不需要 cookies 权限）；输出含明文值 |
 | `sbc wait --text|--selector` | 等待 |
 | `sbc screenshot --out` | 截图（优先 CDP `Page.captureScreenshot`，不切标签；失败才降级） |
 | `sbc end-task [--close-group]` | 结束任务 |

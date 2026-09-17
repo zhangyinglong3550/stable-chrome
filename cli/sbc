@@ -388,6 +388,19 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
+def cmd_cookie_get(args: argparse.Namespace) -> int:
+    """读 cookie（含 HttpOnly）。注意输出里含明文值，别粘进日志/对话。"""
+    params: Dict[str, Any] = {}
+    if args.name:
+        params["name"] = args.name
+    if args.url:
+        params["url"] = args.url
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("cookieGet", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     params: Dict[str, Any] = {"max": args.max}
     if args.tab_id:
@@ -606,6 +619,12 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--tab-id")
     ev.add_argument("--timeout-ms", type=int, default=20000)
     ev.set_defaults(func=cmd_eval)
+
+    ck = sub.add_parser("cookie-get", help="read cookies (incl. HttpOnly) via CDP; returns values")
+    ck.add_argument("--name", help="only this cookie name")
+    ck.add_argument("--url", help="cookie url; defaults to the target tab's current url")
+    ck.add_argument("--tab-id")
+    ck.set_defaults(func=cmd_cookie_get)
 
     sn = sub.add_parser("snapshot", help="list interactive elements")
     sn.add_argument("--max", type=int, default=80)
