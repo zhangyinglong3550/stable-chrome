@@ -366,6 +366,12 @@ def cmd_click(args: argparse.Namespace) -> int:
         params["text"] = args.text
     if args.index is not None:
         params["index"] = args.index
+    if args.node is not None:
+        params["node"] = args.node
+    if args.trusted:
+        params["trusted"] = True
+    if args.settle is not None:
+        params["settle"] = args.settle
     if args.tab_id:
         params["tabId"] = args.tab_id
     r = run_cmd("click", params)
@@ -373,7 +379,13 @@ def cmd_click(args: argparse.Namespace) -> int:
 
 
 def cmd_fill(args: argparse.Namespace) -> int:
-    params = {"selector": args.selector, "value": args.value}
+    params: Dict[str, Any] = {"value": args.value}
+    if args.selector:
+        params["selector"] = args.selector
+    if args.index is not None:
+        params["index"] = args.index
+    if args.node is not None:
+        params["node"] = args.node
     if args.tab_id:
         params["tabId"] = args.tab_id
     r = run_cmd("fill", params)
@@ -605,11 +617,24 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--selector")
     cl.add_argument("--text")
     cl.add_argument("--index", type=int)
+    cl.add_argument("--node", type=int, help="stable element id from snapshot (preferred)")
+    cl.add_argument(
+        "--trusted",
+        action="store_true",
+        help="use CDP input (isTrusted=true); brings the tab to front",
+    )
+    cl.add_argument(
+        "--settle",
+        type=int,
+        help="ms to wait for the page to settle after clicking (default 120, 0 disables)",
+    )
     cl.add_argument("--tab-id")
     cl.set_defaults(func=cmd_click)
 
     f = sub.add_parser("fill", help="fill input")
-    f.add_argument("--selector", required=True)
+    f.add_argument("--selector")
+    f.add_argument("--index", type=int)
+    f.add_argument("--node", type=int, help="stable element id from snapshot (preferred)")
     f.add_argument("--value", required=True)
     f.add_argument("--tab-id")
     f.set_defaults(func=cmd_fill)

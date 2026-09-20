@@ -812,170 +812,757 @@ async function evalCmd(params = {}) {
   return { tabId: String(tabId), result };
 }
 
+// ===== 页面元素扫描器 =====
+// snapshot 和 click 共用同一份采集逻辑，保证「看到的编号」和「点到的元素」永远一致。
+// 每个 DOM 节点会分配一个跨快照稳定的编号（缓存挂在页面的 window 上），
+// 这样 Agent 可以先 snapshot 拿编号，再用 click --node 精准定位，无需重新查询页面。
+function scanPage(opts) {
+  const options = opts || {};
+  const maxResults = options.max || 80;
+  const withGuards = options.guards !== false;
+
+  // ids 用 WeakMap：节点被回收后不会泄漏。nodes 反向映射供后续注入按编号取回元素。
+  // guards 记住「快照那一刻」每个元素的指纹，点击前用来发现元素已被改写。
+  const cache = (window.__sbcScan = window.__sbcScan || {
+    ids: new WeakMap(),
+    nodes: new Map(),
+    guards: new Map(),
+    next: 1,
+  });
+  if (!cache.guards) cache.guards = new Map();
+  for (const [id, el] of cache.nodes) {
+    if (!el.isConnected) {
+      cache.nodes.delete(id);
+      cache.guards.delete(id);
+    }
+  }
+
+  const identity = (el) => {
+    if (!cache.ids.has(el)) cache.ids.set(el, cache.next++);
+    const id = cache.ids.get(el);
+    cache.nodes.set(id, el);
+    return id;
+  };
+
+  const visibleText = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+
+  // 可见性：优先用标准的 checkVisibility，缺失时退回 style 判断
+  const visible = (el) => {
+    if (el.closest('[aria-hidden="true"],[inert]')) return false;
+    if (typeof el.checkVisibility === 'function') {
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+  };
+
+  // 可访问名称：aria-labelledby → aria-label → <label> → value → alt → 文本 → title → placeholder
+  // 图标按钮只有 aria-label、没有可见文字，靠这条链才能被正确识别。
+  const accessibleName = (el, seen) => {
+    const visited = seen || new Set();
+    if (!el || visited.has(el)) return '';
+    visited.add(el);
+    const fromRefs = (el.getAttribute('aria-labelledby') || '')
+      .split(/\s+/)
+      .map((id) => accessibleName(document.getElementById(id), visited))
+      .filter(Boolean)
+      .join(' ');
+    if (fromRefs) return fromRefs;
+    const own = el.getAttribute('aria-label');
+    if (own) return own;
+    const fromLabels = [...(el.labels || [])]
+      .map((l) => accessibleName(l, visited))
+      .filter(Boolean)
+      .join(' ');
+    if (fromLabels) return fromLabels;
+    if (['button', 'submit', 'reset'].includes(el.type) && el.value) return el.value;
+    const alt = el.getAttribute('alt');
+    if (alt) return alt;
+    if (el.tagName !== 'INPUT') {
+      const t = visibleText(el);
+      if (t) return t;
+    }
+    // 图片链接常见于 logo / 图标入口：名称在子元素的 alt 里
+    const img = el.querySelector && el.querySelector('img[alt], svg title');
+    if (img) {
+      const alt = img.getAttribute('alt') || (img.textContent || '').trim();
+      if (alt) return alt;
+    }
+    return el.getAttribute('title') || el.getAttribute('placeholder') || '';
+  };
+
+  const ROLES = [
+    'button', 'link', 'checkbox', 'radio', 'switch', 'tab', 'menuitem',
+    'menuitemradio', 'option', 'gridcell', 'combobox', 'textbox', 'searchbox', 'spinbutton',
+  ];
+  const SELECTOR =
+    'a[href],button,input,textarea,select,summary,[contenteditable="true"],' +
+    ROLES.map((r) => '[role="' + r + '"]').join(',');
+
+  const roleOf = (el) => {
+    const explicit = el.getAttribute('role');
+    if (ROLES.includes(explicit)) return explicit;
+    const tag = el.tagName;
+    if (tag === 'BUTTON' || tag === 'SUMMARY') return 'button';
+    if (tag === 'A') return 'link';
+    if (tag === 'SELECT') return 'combobox';
+    if (tag === 'TEXTAREA' || el.isContentEditable) return 'textbox';
+    if (tag === 'INPUT') {
+      if (el.type === 'checkbox' || el.type === 'radio') return el.type;
+      if (['button', 'submit', 'reset', 'image'].includes(el.type)) return 'button';
+      if (el.type === 'search') return 'searchbox';
+      if (el.type === 'number') return 'spinbutton';
+      if (['text', 'email', 'url', 'tel'].includes(el.type)) return 'textbox';
+    }
+    return null;
+  };
+
+  // 元素指纹：执行前用它确认「决策时看到的」和「现在要点的」是同一个元素。
+  // 除自身属性外还带一段邻近上下文文本，避免同名元素被替换后误判为同一个。
+  const guardOf = (el) => {
+    if (!el.isConnected || !visible(el)) return null;
+    const scope = el.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || el.parentElement;
+    return [
+      identity(el),
+      roleOf(el),
+      accessibleName(el),
+      el.value === undefined ? null : el.value,
+      el.checked === undefined ? null : el.checked,
+      el.selectedIndex === undefined ? null : el.selectedIndex,
+      el.readOnly === undefined ? null : el.readOnly,
+      el.matches(':disabled'),
+      el.getAttribute('aria-disabled'),
+      el.getAttribute('aria-expanded'),
+      el.getAttribute('aria-checked'),
+      el.getAttribute('aria-selected'),
+      el.getAttribute('href'),
+      scope && scope.innerText ? scope.innerText.slice(0, 3000) : '',
+    ].join('\u0001');
+  };
+
+  // 兜底 selector：无 id/name 时不再退化成裸 tag 名，而是带上 role 和名称
+  const selectorOf = (el) => {
+    if (el.id) return '#' + CSS.escape(el.id);
+    if (el.name) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.name) + '"]';
+    const role = roleOf(el);
+    const label = accessibleName(el).slice(0, 40);
+    if (role && label) return '[role="' + role + '"][aria-label="' + label.replace(/"/g, '\\"') + '"]';
+    return el.tagName.toLowerCase();
+  };
+
+  const items = [];
+  const seen = new Set();
+  let omitted = 0;
+  for (const el of document.querySelectorAll(SELECTOR)) {
+    if (['password', 'file', 'hidden'].includes(el.type)) continue;
+    if (!visible(el)) continue;
+    // 不可交互的元素不进候选表，避免 Agent 去点一个点不动的按钮
+    if (el.matches(':disabled') || el.closest('[aria-disabled="true"]')) continue;
+    const r = el.getBoundingClientRect();
+    // 小于 5px 的元素视觉上不可感知，通常是隐藏表单或无障碍占位，
+    // 放进来只会给决策添噪音（坐标点击也落不到它身上）
+    if (r.width < 5 || r.height < 5) continue;
+    if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+    const role = roleOf(el);
+    if (!role) continue;
+
+    const label = accessibleName(el) || role;
+    const key = [el.tagName, role, label, Math.round(r.x), Math.round(r.y)].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const item = {
+      node: identity(el),
+      index: items.length,
+      tag: el.tagName.toLowerCase(),
+      role,
+      name: label,
+      text: visibleText(el),
+      type: el.getAttribute('type'),
+      value: 'value' in el ? String(el.value === undefined ? '' : el.value) : '',
+      href: el.getAttribute('href'),
+      placeholder: el.getAttribute('placeholder'),
+      selector: selectorOf(el),
+      disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+      readOnly: Boolean(el.readOnly) || el.getAttribute('aria-readonly') === 'true',
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+    if (typeof el.checked === 'boolean') item.checked = el.checked;
+    if (el.tagName === 'SELECT') item.selectedValue = el.value;
+    for (const attr of ['expanded', 'selected', 'pressed']) {
+      const v = el.getAttribute('aria-' + attr);
+      if (v !== null) item[attr] = v;
+    }
+    if (withGuards) {
+      const guard = guardOf(el);
+      item.guard = guard;
+      // 记住快照时刻的指纹；click 时重算比对，就能发现「同一个节点已被改写」
+      if (guard !== null) cache.guards.set(item.node, guard);
+    }
+    if (items.length >= maxResults) {
+      omitted += 1;
+      continue;
+    }
+    items.push(item);
+
+    // select 的每个「未选中且未禁用」的选项单独成条：Agent 才能看到有哪些可选值。
+    // click --node 命中 option 时会映射回父 select 的赋值（见 resolveClickTarget）。
+    if (el.tagName === 'SELECT') {
+      for (const opt of el.options) {
+        if (opt.selected || opt.disabled || opt.closest('optgroup[disabled]')) continue;
+        if (items.length >= maxResults) {
+          omitted += 1;
+          continue;
+        }
+        items.push({
+          node: identity(opt),
+          index: items.length,
+          tag: 'option',
+          role: 'option',
+          name: (opt.label || opt.textContent || '').trim().slice(0, 120),
+          text: (opt.textContent || '').trim().slice(0, 120),
+          type: null,
+          value: String(opt.value),
+          href: null,
+          placeholder: null,
+          // option 本身没有独立选择器，用父 select 的
+          selector: item.selector,
+          disabled: false,
+          readOnly: false,
+          selected: false,
+          // 指向所属 select，便于调用方理解层级
+          parentNode: item.node,
+          parentValue: item.selectedValue,
+          x: item.x,
+          y: item.y,
+          width: item.width,
+          height: item.height,
+        });
+      }
+    }
+  }
+
+  // 页面级指纹：用来判断「决策时的页面」和「执行时的页面」是否还是同一个
+  const formState = [...document.querySelectorAll('input,textarea,select')]
+    .filter((e) => !['password', 'file', 'hidden'].includes(e.type))
+    .map((e) => [identity(e), e.value, e.checked, e.selectedIndex, e.disabled].join('~'))
+    .join('|');
+
+  const marker = [
+    location.href,
+    document.title,
+    scrollX,
+    scrollY,
+    innerWidth,
+    innerHeight,
+    document.querySelectorAll('*').length,
+    formState,
+  ].join('\u0002');
+
+  // 把指纹函数挂到缓存上，供后续注入（click / fill）重算比对。
+  // 闭包引用的是同一个 cache 对象，不会额外持有旧状态。
+  cache.guardOf = guardOf;
+
+  // 与「快照那一刻」的指纹比对。元素还在、但自身属性已被改写时要说出来——
+  // 这正是「决策时看到的」和「现在要操作的」不是同一个东西的典型情形。
+  // 前 13 段是元素自身属性，第 14 段是邻近上下文文本（后者变化频繁，单独区分）。
+  cache.staleCheck = (node, el) => {
+    const out = { stale: false, staleFields: [], contextChanged: false };
+    if (node == null || !cache.guards) return out;
+    const stored = cache.guards.get(node);
+    const current = guardOf(el);
+    if (!stored || !current || stored === current) return out;
+    const FIELDS = [
+      'node', 'role', 'name', 'value', 'checked', 'selectedIndex', 'readOnly',
+      'disabled', 'aria-disabled', 'aria-expanded', 'aria-checked', 'aria-selected',
+      'href', 'context',
+    ];
+    const before = stored.split('\u0001');
+    const now = current.split('\u0001');
+    for (let i = 0; i < Math.max(before.length, now.length); i += 1) {
+      if (before[i] === now[i]) continue;
+      const field = FIELDS[i] || 'field' + i;
+      if (field === 'context') out.contextChanged = true;
+      else {
+        out.stale = true;
+        out.staleFields.push(field);
+      }
+    }
+    return out;
+  };
+
+  // 视口内可见文本：给调用方做页面上下文。屏幕外的正文不进上下文，避免上下文被撑爆。
+  const words = [];
+  let textLen = 0;
+  if (document.body) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    let node;
+    while ((node = walker.nextNode()) && textLen < 4000) {
+      const value = (node.textContent || '').trim();
+      const parent = node.parentElement;
+      if (!value || !parent) continue;
+      if (parent.closest('script,style,noscript,template')) continue;
+      if (!visible(parent)) continue;
+      range.selectNodeContents(node);
+      const tr = range.getBoundingClientRect();
+      if (tr.width > 0 && tr.height > 0 && tr.bottom > 0 && tr.top < innerHeight && tr.right > 0 && tr.left < innerWidth) {
+        words.push(value);
+        textLen += value.length;
+      }
+    }
+  }
+
+  const scrollHeight = document.documentElement.scrollHeight;
+  return {
+    url: location.href,
+    title: document.title,
+    marker,
+    pageText: words.join('\n').slice(0, 4000),
+    // 页面比视口高时，调用方据此判断该不该滚动
+    scroll: {
+      y: Math.round(scrollY),
+      height: scrollHeight,
+      viewport: innerHeight,
+      canScrollUp: scrollY > 0,
+      canScrollDown: scrollY + innerHeight < scrollHeight - 2,
+    },
+    count: items.length,
+    // 被 max 截断掉的候选数量：非 0 说明还有元素没列出来
+    omitted,
+    items,
+  };
+}
+
 async function snapshot(params = {}) {
   const tabId = await resolveTabId(params);
-  const max = params.max || 80;
-  const items = await chrome.scripting.executeScript({
+  const result = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (maxResults) => {
-      const selectors = [
-        'button',
-        'a[href]',
-        'input',
-        'textarea',
-        'select',
-        '[role="button"]',
-        '[role="link"]',
-        '[contenteditable="true"]',
-      ];
-      const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
-      const seen = new Set();
-      const items = [];
-      for (const el of nodes) {
-        const r = el.getBoundingClientRect();
-        if (r.width < 2 || r.height < 2) continue;
-        if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
-        const style = window.getComputedStyle(el);
-        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
-        const text = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '')
-          .trim()
-          .replace(/\s+/g, ' ')
-          .slice(0, 120);
-        const key = [el.tagName, text, Math.round(r.x), Math.round(r.y)].join('|');
-        if (seen.has(key)) continue;
-        seen.add(key);
-        // generate a reasonably stable selector
-        let selector = el.tagName.toLowerCase();
-        if (el.id) selector = `#${CSS.escape(el.id)}`;
-        else if (el.name) selector = `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
-        items.push({
-          index: items.length,
-          tag: el.tagName.toLowerCase(),
-          role: el.getAttribute('role'),
-          type: el.getAttribute('type'),
-          name: el.getAttribute('name'),
-          placeholder: el.getAttribute('placeholder'),
-          ariaLabel: el.getAttribute('aria-label'),
-          text,
-          href: el.getAttribute('href'),
-          selector,
-          x: Math.round(r.x),
-          y: Math.round(r.y),
-          width: Math.round(r.width),
-          height: Math.round(r.height),
-        });
-        if (items.length >= maxResults) break;
-      }
-      return items;
-    },
-    args: [max],
+    func: scanPage,
+    args: [{ max: params.max || 80 }],
   });
-  return { tabId: String(tabId), items: items?.[0]?.result || [] };
+  const page = result?.[0]?.result || { url: '', title: '', marker: '', items: [] };
+  return {
+    tabId: String(tabId),
+    url: page.url,
+    title: page.title,
+    marker: page.marker,
+    pageText: page.pageText || '',
+    scroll: page.scroll || null,
+    count: page.items.length,
+    omitted: page.omitted || 0,
+    items: page.items,
+  };
+}
+
+// 动作后等页面稳定。
+// 计时必须放在扩展侧：页面里的 setTimeout 在后台标签会被 Chrome 节流到约 1 秒，
+// 用它做轮询会把 120ms 的等待拖成 800ms+。页面里只装 MutationObserver 记录变动。
+async function waitForSettle(tabId, maxMs) {
+  const cap = Math.max(0, Math.min(Number(maxMs) || 0, 3000));
+  if (!cap) return { changed: false, waitedMs: 0 };
+  const started = Date.now();
+  const first = Math.min(cap, 60);
+  await sleep(first);
+  let mutated = await readMutationFlag(tabId);
+  // 前 60ms 没动静，再给剩下的时间一次机会；有动静就提前结束
+  if (!mutated && cap > first) {
+    await sleep(cap - first);
+    mutated = await readMutationFlag(tabId);
+  }
+  return { changed: mutated, waitedMs: Date.now() - started };
+}
+
+// 读取页面上的变动计数（由 pageMarker 里的观察器维护）
+async function readMutationFlag(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const m = window.__sbcMut;
+        return m ? m.count > 0 : false;
+      },
+    });
+    return Boolean(r?.[0]?.result);
+  } catch {
+    return false;
+  }
+}
+
+// 轻量页面指纹：只用于判断「动作前后页面是否变化」，不做全量扫描。
+// 顺带装好变动观察器并清零计数，供动作后的等待判断是否该提前结束。
+async function pageMarker(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const text = document.body ? document.body.innerText || '' : '';
+        // 表单值也算页面状态：select/checkbox 的改动不会改变节点数或文本长度
+        const forms = [...document.querySelectorAll('input,textarea,select')]
+          .filter((e) => !['password', 'file', 'hidden'].includes(e.type))
+          .map((e) => e.value + ':' + (e.checked === undefined ? '' : e.checked))
+          .join('|')
+          .slice(0, 2000);
+        // 变动观察器：幂等安装，每次调用清零计数
+        if (!window.__sbcMut) {
+          const state = { count: 0 };
+          window.__sbcMut = state;
+          try {
+            new MutationObserver(() => {
+              state.count += 1;
+            }).observe(document.documentElement, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              characterData: true,
+            });
+          } catch {
+            /* 少数页面不允许观察，此时 count 恒为 0，等待会走满上限 */
+          }
+        }
+        window.__sbcMut.count = 0;
+        return {
+          url: location.href,
+          title: document.title,
+          marker: [
+            location.href,
+            document.title,
+            document.querySelectorAll('*').length,
+            text.length,
+            scrollX,
+            scrollY,
+            forms,
+          ].join('|'),
+        };
+      },
+    });
+    return r?.[0]?.result || { url: '', title: '', marker: '' };
+  } catch {
+    return { url: '', title: '', marker: '' };
+  }
+}
+
+// 解析点击目标并算出屏幕坐标。
+// node 走页面内的稳定编号缓存；index 走与 snapshot 完全相同的扫描逻辑
+// （修复原先只按几何过滤、漏掉可见性与去重导致的编号错位）。
+// 把 node / index 统一解析成稳定编号。index 走与 snapshot 完全相同的扫描逻辑
+// （修复原先只按几何过滤、漏掉可见性与去重导致的编号错位）。
+// 返回 null 表示调用方给的是 selector/text，需要各自再解析。
+async function resolveNode(tabId, params) {
+  if (params.node != null) return params.node;
+  if (typeof params.index !== 'number') return null;
+  const scan = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: scanPage,
+    args: [{ max: params.index + 1, guards: false }],
+  });
+  const items = scan?.[0]?.result?.items || [];
+  const hit = items[params.index];
+  if (!hit) {
+    throw new Error(`index ${params.index} out of range (page has ${items.length} interactive elements)`);
+  }
+  return hit.node;
+}
+
+async function resolveClickTarget(tabId, params) {
+  const node = await resolveNode(tabId, params);
+  const result = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (opts) => {
+      const cache = window.__sbcScan;
+      let el = null;
+      let how = '';
+      if (opts.node != null) {
+        el = cache && cache.nodes ? cache.nodes.get(opts.node) : null;
+        how = 'node';
+      }
+      if (!el && opts.selector) {
+        el = document.querySelector(opts.selector);
+        how = 'selector';
+      }
+      if (!el && opts.text) {
+        const all = Array.from(document.querySelectorAll('button,a,[role="button"],[role="link"],span,div'));
+        el =
+          all.find((n) => (n.innerText || n.textContent || '').trim() === opts.text) ||
+          all.find((n) => (n.innerText || n.textContent || '').trim().includes(opts.text)) ||
+          null;
+        how = 'text';
+      }
+      if (!el) return { ok: false, error: 'element not found' };
+      if (!el.isConnected) return { ok: false, error: 'element is detached from the document' };
+
+      const stale = cache && cache.staleCheck ? cache.staleCheck(opts.node, el) : {};
+
+      // option 没法用坐标点（原生下拉的选项不在普通命中测试里），
+      // 映射成「给父 select 赋值」，由调用方在记录前置状态之后再执行。
+      if (el.tagName === 'OPTION') {
+        const parent = el.closest('select');
+        if (!parent) return { ok: false, error: 'option has no parent select' };
+        if (parent.disabled || el.disabled) return { ok: false, error: 'target is disabled' };
+        return {
+          ok: true,
+          kind: 'select',
+          how,
+          selectNode: cache && cache.ids ? cache.ids.get(parent) : null,
+          optionValue: String(el.value),
+          tag: 'option',
+          name: (el.label || el.textContent || '').trim().slice(0, 120),
+          currentValue: String(parent.value),
+          stale: Boolean(stale.stale),
+          staleFields: stale.staleFields || [],
+          contextChanged: Boolean(stale.contextChanged),
+        };
+      }
+
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return { ok: false, error: 'element has no visible box' };
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      // 遮挡检测：中心点被别的元素盖住时，点击落不到目标上
+      const top = document.elementFromPoint(cx, cy);
+      const occluded = !(top === el || el.contains(top) || (top && top.contains(el)));
+      const text = (el.innerText || el.textContent || '').trim().slice(0, 120);
+      const name = el.getAttribute('aria-label') || el.getAttribute('title') || text;
+      return {
+        ok: true,
+        how,
+        x: cx,
+        y: cy,
+        tag: el.tagName.toLowerCase(),
+        name: String(name).slice(0, 120),
+        text,
+        occluded,
+        coveredBy: occluded && top ? top.tagName.toLowerCase() : null,
+        disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+        stale: Boolean(stale.stale),
+        staleFields: stale.staleFields || [],
+        contextChanged: Boolean(stale.contextChanged),
+      };
+    },
+    args: [{ node: node == null ? null : node, selector: params.selector || null, text: params.text || null }],
+  });
+  const value = result?.[0]?.result;
+  if (!value?.ok) throw new Error(value?.error || 'click failed');
+  return value;
 }
 
 async function click(params = {}) {
   const tabId = await resolveTabId(params);
-  const selector = params.selector;
-  const text = params.text;
-  const index = params.index;
-  if (selector == null && text == null && index == null) {
-    throw new Error('click requires selector | text | index');
+  const { selector, text, index, node } = params;
+  if (selector == null && text == null && index == null && node == null) {
+    throw new Error('click requires node | index | selector | text');
   }
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: (sel, txt, idx) => {
-      let el = null;
-      if (typeof idx === 'number') {
-        // rebuild snapshot order roughly
-        const selectors = [
-          'button',
-          'a[href]',
-          'input',
-          'textarea',
-          'select',
-          '[role="button"]',
-          '[role="link"]',
-          '[contenteditable="true"]',
-        ];
-        const nodes = Array.from(document.querySelectorAll(selectors.join(','))).filter((n) => {
-          const r = n.getBoundingClientRect();
-          return r.width >= 2 && r.height >= 2 && r.bottom >= 0 && r.right >= 0 && r.top <= innerHeight && r.left <= innerWidth;
-        });
-        el = nodes[idx] || null;
-      } else if (sel) {
-        el = document.querySelector(sel);
-      } else if (txt) {
-        const all = Array.from(document.querySelectorAll('button,a,[role="button"],[role="link"],span,div'));
-        el =
-          all.find((n) => (n.innerText || n.textContent || '').trim() === txt) ||
-          all.find((n) => (n.innerText || n.textContent || '').trim().includes(txt)) ||
-          null;
-      }
-      if (!el) return { ok: false, error: 'element not found' };
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      const rect = el.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        el.dispatchEvent(
-          new MouseEvent(type, {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: cx,
-            clientY: cy,
-          }),
-        );
-      }
-      if (typeof el.click === 'function') {
-        try {
-          el.click();
-        } catch {}
-      }
-      return {
-        ok: true,
-        tag: el.tagName.toLowerCase(),
-        text: (el.innerText || el.textContent || '').trim().slice(0, 120),
-      };
-    },
-    args: [selector || null, text || null, typeof index === 'number' ? index : null],
-  });
-  const value = result?.[0]?.result;
-  if (!value?.ok) throw new Error(value?.error || 'click failed');
-  return { tabId: String(tabId), ...value };
+  const target = await resolveClickTarget(tabId, params);
+  if (target.disabled) throw new Error(`target is disabled: ${target.name || target.tag}`);
+  if (target.occluded) {
+    throw new Error(`target is covered by <${target.coveredBy}>; scroll or dismiss the overlay first`);
+  }
+
+  const before = await pageMarker(tabId);
+
+  // option 走「给父 select 赋值」，不派发鼠标事件
+  if (target.kind === 'select') {
+    const applied = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (selectNode, val) => {
+        const cache = window.__sbcScan;
+        const el = cache && cache.nodes ? cache.nodes.get(selectNode) : null;
+        if (!el || el.tagName !== 'SELECT') return { ok: false, error: 'parent select is gone; re-run snapshot' };
+        let proto = Object.getPrototypeOf(el);
+        let setter = null;
+        while (proto && !setter) {
+          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+          if (desc && desc.set) setter = desc.set;
+          proto = Object.getPrototypeOf(proto);
+        }
+        if (setter) setter.call(el, val);
+        else el.value = val;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, value: String(el.value) };
+      },
+      args: [target.selectNode, target.optionValue],
+    });
+    const a = applied?.[0]?.result;
+    if (!a?.ok) throw new Error(a?.error || 'select failed');
+    const settleMs = params.settle === undefined ? 120 : Number(params.settle) || 0;
+    const settle = await waitForSettle(tabId, settleMs);
+    const afterSel = await pageMarker(tabId);
+    return {
+      tabId: String(tabId),
+      ok: true,
+      via: 'select',
+      how: target.how,
+      tag: target.tag,
+      name: target.name,
+      previousValue: target.currentValue,
+      value: a.value,
+      stale: target.stale,
+      staleFields: target.staleFields,
+      contextChanged: target.contextChanged,
+      changed: before.marker !== afterSel.marker,
+      settleMs: settle.waitedMs,
+      settleSawMutation: settle.changed,
+      urlChanged: before.url !== afterSel.url,
+      url: afterSel.url,
+    };
+  }
+
+  // 优先走 CDP 可信输入：合成事件不带 isTrusted，对做校验的站点点不动。
+  // 注意：后台标签页只收得到 mouseMoved、收不到 mousePressed，所以可信模式
+  // 需要先把标签提到前台（Page.bringToFront）。这是 --trusted 的已知代价。
+  let via = 'synthetic';
+  if (params.trusted === true) {
+    try {
+      await ensureDebugger(tabId);
+      await chrome.debugger.sendCommand({ tabId }, 'Page.bringToFront');
+      const base = { x: target.x, y: target.y, button: 'left', clickCount: 1, buttons: 1 };
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x: target.x, y: target.y,
+      });
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
+      via = 'cdp';
+    } catch {
+      via = 'synthetic';
+    }
+  }
+  if (via === 'synthetic') {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (x, y) => {
+        const el = document.elementFromPoint(x, y);
+        if (!el) return false;
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          el.dispatchEvent(
+            new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }),
+          );
+        }
+        return true;
+      },
+      args: [target.x, target.y],
+    });
+  }
+  // 等页面稳定再取后置指纹：异步渲染的站点不会立刻反映变化，直接比较会误报 changed=false。
+  // 默认 120ms 上限；传 settle: 0 可关闭，传更大的值可等更久。
+  const settleMs = params.settle === undefined ? 120 : Number(params.settle) || 0;
+  const settle = await waitForSettle(tabId, settleMs);
+  const after = await pageMarker(tabId);
+  return {
+    tabId: String(tabId),
+    ok: true,
+    via,
+    how: target.how,
+    tag: target.tag,
+    name: target.name,
+    x: Math.round(target.x),
+    y: Math.round(target.y),
+    // stale：元素的自身属性相对「快照那一刻」变了（名称/值/勾选/禁用等）。
+    // 这通常意味着你要点的已经不是当初看到的那个东西，建议重新 snapshot 再决定。
+    // contextChanged：只是邻近上下文文本变了，元素本身没变，一般是安全的。
+    stale: target.stale,
+    staleFields: target.staleFields,
+    contextChanged: target.contextChanged,
+    // changed：URL、标题、节点数、文本长度或滚动位置有变化。
+    // 已经等过 settle 毫秒，因此对异步渲染的站点也基本可靠；仍为 false 时可用 sbc wait 再确认。
+    changed: before.marker !== after.marker,
+    settleMs: settle.waitedMs,
+    settleSawMutation: settle.changed,
+    urlChanged: before.url !== after.url,
+    url: after.url,
+  };
 }
 
 async function fill(params = {}) {
   const tabId = await resolveTabId(params);
-  const selector = params.selector;
   const value = params.value ?? params.text ?? '';
-  if (!selector) throw new Error('fill requires selector');
+  const { selector, index, node } = params;
+  if (selector == null && node == null && index == null) {
+    throw new Error('fill requires node | index | selector');
+  }
+  const resolved = await resolveNode(tabId, params);
   const result = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (sel, val) => {
-      const el = document.querySelector(sel);
-      if (!el) return { ok: false, error: 'element not found' };
-      el.focus();
-      if ('value' in el) {
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (desc?.set) desc.set.call(el, val);
-        else el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      } else if (el.isContentEditable) {
-        el.textContent = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      } else {
-        return { ok: false, error: 'element not fillable' };
+    func: (opts, val) => {
+      try {
+        const cache = window.__sbcScan;
+        let el = null;
+        let how = '';
+        if (opts.node != null) {
+          el = cache && cache.nodes ? cache.nodes.get(opts.node) : null;
+          how = 'node';
+        }
+        if (!el && opts.selector) {
+          el = document.querySelector(opts.selector);
+          how = 'selector';
+        }
+        if (!el) return { ok: false, error: 'element not found' };
+        if (!el.isConnected) return { ok: false, error: 'element is detached from the document' };
+        if (el.matches(':disabled') || el.readOnly || el.getAttribute('aria-readonly') === 'true') {
+          return { ok: false, error: 'element is not editable (disabled or read-only)' };
+        }
+        // 勾选类控件没有「填值」语义，写 value 不会改变勾选状态，容易误导
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          return { ok: false, error: 'use click to toggle a checkbox or radio, not fill' };
+        }
+        const stale = cache && cache.staleCheck ? cache.staleCheck(opts.node, el) : {};
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        el.focus();
+        if ('value' in el) {
+          // 沿原型链找 value 的 setter：input / textarea / select 各有各的原型，
+          // 写死 HTMLInputElement.prototype 对 select 会抛 Illegal invocation
+          let proto = Object.getPrototypeOf(el);
+          let setter = null;
+          while (proto && !setter) {
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) setter = desc.set;
+            proto = Object.getPrototypeOf(proto);
+          }
+          if (setter) setter.call(el, val);
+          else el.value = val;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (el.isContentEditable) {
+          el.textContent = val;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        } else {
+          return { ok: false, error: 'element not fillable' };
+        }
+        const text = (el.innerText || el.textContent || '').trim().slice(0, 120);
+        const name = el.getAttribute('aria-label') || el.getAttribute('title') || text;
+        return {
+          ok: true,
+          how,
+          tag: el.tagName.toLowerCase(),
+          name: String(name).slice(0, 120),
+          value: 'value' in el ? String(el.value === undefined ? '' : el.value) : text,
+          stale: Boolean(stale.stale),
+          staleFields: stale.staleFields || [],
+          contextChanged: Boolean(stale.contextChanged),
+        };
+      } catch (e) {
+        return { ok: false, error: 'fill threw: ' + String((e && e.message) || e).slice(0, 160) };
       }
-      return { ok: true };
     },
-    args: [selector, String(value)],
+    args: [{ node: resolved == null ? null : resolved, selector: selector || null }, String(value)],
   });
   const v = result?.[0]?.result;
   if (!v?.ok) throw new Error(v?.error || 'fill failed');
-  return { tabId: String(tabId), ok: true, selector, value: String(value) };
+  return {
+    tabId: String(tabId),
+    ok: true,
+    how: v.how,
+    tag: v.tag,
+    name: v.name,
+    value: v.value,
+    stale: v.stale,
+    staleFields: v.staleFields,
+    contextChanged: v.contextChanged,
+  };
 }
 
 

@@ -40,12 +40,28 @@ sbc new-tab --url "https://example.com"   # 同任务默认永远单标签（后
 sbc new-tab --url "https://example.com/next"  # 再次调用 = 同标签导航，不新开
 # 等价写法：sbc goto "https://example.com/next"
 # 真要第二页：sbc new-tab --url "..." --force
-sbc snapshot
-sbc click --text "登录"
+sbc snapshot                              # 拿到每个元素的 node 编号
+sbc click --node 12                       # 用编号点击（最稳，推荐）
 sbc fill --selector "input[name=user]" --value "xxx"
 sbc screenshot --out /tmp/a.png           # 优先 CDP 截图，不切用户标签
 sbc end-task
 ```
+
+## 怎么选点击方式（按稳定性排序）
+
+1. **`--node N`（推荐）**：编号来自 `snapshot`，跨快照稳定，页面重排也不会点错
+2. **`--index N`**：与 `snapshot` 的 `index` 字段严格一一对应（同一次采集逻辑）
+3. **`--selector`**：CSS 选择器，取第一个匹配
+4. **`--text "..."`**：按可见文字全等/包含匹配，重名元素时不可靠
+
+**点击会自动拒绝两种情况**并说明原因：目标被遮挡（`target is covered by <div>`）、目标是 disabled。
+返回里的 `changed` 表示动作后 URL/标题/节点数/文本长度是否变化——异步渲染的站点可能返回 `false`，需要自己 `sbc wait` 再确认。
+
+**`stale` 是正确率的关键信号**：快照时会给每个元素记下指纹，点击/输入前重算比对。如果元素自身属性（`name` / `value` / `checked` / `disabled` 等）变了，返回 `stale: true` 和 `staleFields`——**说明你要操作的可能已经不是当初看到的那个元素，应该重新 `snapshot` 再决定**。只是邻近上下文文字变了则报 `contextChanged`，一般可以忽略。
+
+**`changed` 现在会等页面稳定再判断**：动作后最多等 `--settle`（默认 120ms），一旦观察到 DOM 变动就再等两帧返回。所以对异步渲染的站点也基本可靠。返回里的 `settleMs` 是实际等了多久，`settleSawMutation` 表示期间有没有观察到变动。`--settle 0` 可关闭等待（更快，但 `changed` 会退回成不可靠的启发式）。
+
+`--trusted` 走 CDP 真实输入（`isTrusted=true`），用于校验事件可信度的站点；**代价是会把这个标签提到前台**。默认用合成事件，不抢焦点。
 
 ## 命令速查
 | 命令 | 作用 |
@@ -59,10 +75,10 @@ sbc end-task
 | `sbc new-tab --url` | 同任务默认单标签：有 claimed 则导航复用；`--force` 才新建第二页 |
 | `sbc close-tab [--tab-id]` | 关闭标签（默认可关当前 claimed） |
 | `sbc goto URL` | 在已 claim 标签上导航（与默认 new-tab 等价） |
-| `sbc click --selector|--text|--index` | 点击 |
-| `sbc fill --selector --value` | 输入 |
+| `sbc click --node|--index|--selector|--text` | 点击；`--node` 最稳，`--trusted` 走 CDP 可信输入（会前置标签），`--settle MS` 调动作后的等待 |
+| `sbc fill --node|--index|--selector --value` | 输入；和 `click` 一样支持 `--node` 定位。checkbox/radio 请用 `click` 切换 |
 | `sbc eval 'document.title'` | 执行 JS |
-| `sbc snapshot` | 可见可交互元素 |
+| `sbc snapshot [--max N]` | 可见可交互元素，含稳定编号/可访问名称/元素状态 |
 | `sbc content` | 读正文摘要 |
 | `sbc cookie-get [--name NAME] [--url URL]` | 读 cookie（**含 HttpOnly**，走 CDP，不需要 cookies 权限）；输出含明文值 |
 | `sbc wait --text|--selector` | 等待 |
@@ -72,7 +88,42 @@ sbc end-task
 | `sbc net-get [--tab-id] [--grep STR]` | 读取捕获的 API 请求（不停止） |
 | `sbc net-stop [--tab-id] [--grep STR]` | 停止捕获并输出所有请求 |
 
+## snapshot 输出字段
+
+```json
+{
+  "url": "...", "title": "...",
+  "count": 10, "omitted": 0,      // omitted>0 说明还有元素没列出来，调大 --max
+  "marker": "...",                 // 页面指纹
+  "pageText": "...",               // 视口内可见文本（上限 4000 字），当页面上下文用
+  "scroll": { "y": 0, "height": 934, "viewport": 934,
+              "canScrollUp": false, "canScrollDown": false },
+  "items": [{
+    "node": 12,            // 跨快照稳定的编号，click --node 用它
+    "index": 3,            // 本次快照内的位置，click --index 用它
+    "role": "button",      // 归一化角色：button/link/checkbox/combobox/textbox/option...
+    "name": "关闭对话框",   // 可访问名称，按 aria-labelledby → aria-label → label → 文本 → img alt → title → placeholder 取值
+    "text": "✕",           // 可见文字
+    "value": "", "href": null, "placeholder": null,
+    "selector": "#close",  // 兜底用；无 id/name 时会带 role+aria-label，不再退化成裸 tag
+    "disabled": false, "readOnly": false,
+    "checked": true,       // checkbox/radio 专有
+    "selectedValue": "b",  // select 专有
+    "expanded": "true",    // aria-expanded 等状态按需出现
+    "x": 100, "y": 200, "width": 38, "height": 36,
+    "guard": "..."         // 元素指纹，用于判断元素是否还是决策时的那个
+  }]
+}
+```
+
+**原生下拉的每个「未选中且未禁用」选项会单独成一条**，`role: "option"`，带 `parentNode`（所属 select 的 node）和 `value`。直接 `click --node <选项的node>` 就能选中——内部会映射成给父 select 赋值，不走鼠标事件。
+
+**已经过滤掉的**（不会出现在结果里）：`disabled` / `aria-disabled` 元素、`display:none` / `visibility:hidden` / `opacity:0` / `aria-hidden` / `inert` 元素、小于 5px 的元素、视口外的元素。
+
+**只收录视口内的元素**——想操作页面下方的元素，先看 `scroll.canScrollDown`，需要时 `sbc eval 'window.scrollBy(0,600)'` 再快照。
+
 ## 硬规则
+
 1. **禁止**默认使用 9222 / 复制 profile / 匿名 Chromium 冒充连接成功
 2. 扩展离线时：先 `sbc setup`（或确认 Bridge + 扩展已加载），再重试
 3. 自动化页面必须进任务标签分组，减少干扰用户日常浏览
@@ -80,10 +131,11 @@ sbc end-task
 5. **默认不抢浏览器焦点**：`claim` / `start-task` / `new-tab` / `goto` 均静默后台执行；只有显式 `--focus` / `--active` 才前置窗口。
 6. **`start-task` 默认独立窗口**（unfocused）：Agent 与用户分窗；只有用户明确要求同窗时才用 `--same-window`。
 7. **截图默认不切标签**：优先 `chrome.debugger` → `Page.captureScreenshot`；仅 CDP 失败时才短暂 `captureVisibleTab` 并恢复。
-8. 新建任务标签分组颜色自动轮换（可 `start-task --color green` 指定）；复用已有分组不覆盖颜色
+8. 新建任务标签分组颜色从 8 色里**随机**取（`title + 时间戳 + 随机数` 做 hash），不保证并存的多个分组颜色互不相同；要固定色用 `start-task --color green`。复用已有分组不覆盖颜色
 9. **同会话复用**：`start-task` 可重复调用，状态跨扩展 SW 重启持久化；不要为每个子步骤再 `start-task` 一套
 10. **同任务永远单标签**：`new-tab` 默认 = 导航复用 claimed 标签；只有显式 `--force` 才开第二页
 11. **不收养用户工作区分组**：`claim` / `start-task` 不会把你已有的标签组改名成任务组；会把目标标签拆出单独建 Agent 组
+12. **`click` 默认不抢焦点**：合成事件在后台标签可用；只有显式 `--trusted` 才走 CDP 并把标签提到前台。后台标签收不到 CDP 的 `mousePressed`，这是 Chrome 的行为，不是 bug
 
 ## Agent 用法注意
 - 一次会话：`start-task` 一次（默认独立窗）→ 反复 `new-tab --url` 只会在同一标签跳转
