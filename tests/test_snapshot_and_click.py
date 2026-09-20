@@ -191,6 +191,28 @@ def test_cli_exposes_settle():
     assert 'params["settle"] = args.settle' in cli
 
 
+def test_role_less_controls_are_collected_as_fallback():
+    """很多现代框架的自定义下拉是纯 div/span，没有 role，只靠 role 会整片漏掉。"""
+    source = BACKGROUND.read_text()
+    assert "FALLBACK_MAX" in source
+    assert "FALLBACK_SCAN_MAX" in source
+    # 只在通过便宜筛选后才算样式，且要求指针光标 + 叶子节点
+    assert "getComputedStyle(el).cursor !== 'pointer'" in source
+    assert "el.children.length !== 0" in source
+    # 不谎报语义：单独用 clickable 标记，并显式标注是启发式
+    assert "role: 'clickable'" in source
+    assert "heuristic: true" in source
+    # 有 role 的元素归主循环，兜底不重复收
+    assert "if (roleOf(el)) continue;" in source
+
+
+def test_decider_accepts_the_heuristic_role():
+    """兜底采集出来的 clickable 必须能进决策候选，否则等于白采。"""
+    cli = CLI.read_text()
+    click_roles = cli.split("CLICK_ROLES = {", 1)[1].split("}", 1)[0]
+    assert '"clickable"' in click_roles
+
+
 def test_docs_describe_the_new_surface():
     skill = SKILL.read_text()
     protocol = PROTOCOL.read_text()

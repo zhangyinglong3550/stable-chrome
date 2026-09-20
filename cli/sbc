@@ -284,6 +284,445 @@ def cmd_open_tabs(_: argparse.Namespace) -> int:
 
 DEFAULT_TASK_TITLE = "Agent 任务"
 
+# ===== 决策层（可选） =====
+# 把「下一步点哪里」从大模型写选择器，换成在封闭选项里做选择。
+#
+# 关键设计：缺 TYPESAFE_API_KEY 时优雅降级，不是报错退出。decide 会把本该喂给
+# 决策器的那份输入（编号表 + 目标）原样返回，由调用方的大模型自己决策，再执行
+# `sbc click --node` / `sbc fill --node`。
+#
+# 这样有 JEV 和没 JEV 的人用同一套工具、同一套架构，只是决策速度不同；
+# 哪天拿到 key，改一个环境变量就生效，不用改调用方代码。
+
+TYPESAFE_URL = os.getenv("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone")
+TYPESAFE_MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
+
+# JEV 的 Choice 基数上限是 255（超过要走两阶段打分），这里留足余量
+MAX_TARGET_OPTIONS = 200
+
+CLICK_ROLES = {
+    "button", "link", "checkbox", "radio", "switch", "tab",
+    "menuitem", "menuitemradio", "option", "gridcell", "combobox",
+    # 扫描器对无 role 的自定义控件会标成 clickable（启发式），别把它漏掉
+    "clickable",
+}
+TYPE_ROLES = {"textbox", "searchbox", "spinbutton"}
+
+OPERATION_LABELS = {
+    "CLICK": "点击某个元素、按钮、菜单项、下拉选项或链接",
+    "TYPE_TEXT": "往某个可编辑输入框里输入文字（文字内容由调用方提供）",
+    "SCROLL_DOWN": "向下滚动以看到更多内容",
+    "SCROLL_UP": "向上滚动",
+    "WAIT": "等页面自己更新（异步加载中）",
+    "DONE": "目标已经在当前页面上可见地达成了",
+}
+
+
+def _lean_item(item: dict) -> dict:
+    """给决策器/调用方看的精简条目：去掉 guard 指纹、坐标等内部字段。
+
+    guard 里含 \\u0001 分隔符且很长，是给 click 做 stale 校验用的，
+    决策阶段不需要，放出去只会污染上下文。
+    """
+    keep = (
+        "node", "index", "role", "name", "text", "value",
+        "checked", "selectedValue", "expanded", "href", "placeholder",
+        "disabled", "readOnly", "parentNode",
+    )
+    return {k: item[k] for k in keep if k in item}
+
+
+def _describe_element(item: dict) -> str:
+    """把一个元素条目渲染成给决策器看的单行描述。"""
+    bits = [str(item.get("role"))]
+    if item.get("name"):
+        bits.append(f"“{item['name']}”")
+    if item.get("value"):
+        bits.append(f"value={item['value']!r}")
+    if item.get("checked") is not None:
+        bits.append(f"checked={item['checked']}")
+    if item.get("selectedValue"):
+        bits.append(f"当前值={item['selectedValue']!r}")
+    if item.get("href"):
+        bits.append(f"href={str(item['href'])[:60]}")
+    if item.get("parentNode"):
+        bits.append(f"(属于 select #{item['parentNode']})")
+    if item.get("disabled"):
+        bits.append("DISABLED")
+    return " ".join(bits)
+
+
+def build_decide_questions(
+    snapshot: dict, goal: str, allowed: Optional[List[str]] = None
+) -> tuple:
+    """把快照转成 JEV 的封闭选择题。
+
+    返回 (state, questions, targets, truncated)。targets 把选项 key 映射回元素条目，
+    便于把决策结果翻译成 `sbc click --node`。
+    """
+    items = snapshot.get("items") or []
+    allow = {a.upper() for a in allowed} if allowed else None
+
+    clickable: List[dict] = []
+    typable: List[dict] = []
+    for it in items:
+        role = it.get("role")
+        if it.get("disabled"):
+            continue
+        if role in TYPE_ROLES and not it.get("readOnly"):
+            typable.append(it)
+            clickable.append(it)
+        elif role in CLICK_ROLES:
+            clickable.append(it)
+
+    truncated = 0
+    if len(clickable) > MAX_TARGET_OPTIONS:
+        truncated = len(clickable) - MAX_TARGET_OPTIONS
+        clickable = clickable[:MAX_TARGET_OPTIONS]
+    if len(typable) > MAX_TARGET_OPTIONS:
+        typable = typable[:MAX_TARGET_OPTIONS]
+
+    operations = dict(OPERATION_LABELS)
+    if not typable:
+        operations.pop("TYPE_TEXT", None)
+    scroll = snapshot.get("scroll") or {}
+    if not scroll.get("canScrollDown"):
+        operations.pop("SCROLL_DOWN", None)
+    if not scroll.get("canScrollUp"):
+        operations.pop("SCROLL_UP", None)
+    if allow:
+        operations = {k: v for k, v in operations.items() if k in allow}
+
+    questions: Dict[str, Any] = {
+        "operation": {
+            "type": "choice",
+            "criteria": operations,
+            "instructions": (
+                f"目标是：{goal}\n\n"
+                "下一步应该执行上面哪一个操作？只选最直接推进目标的那一个。"
+                "如果目标已经在当前页面上可见地达成，选 DONE。"
+            ),
+        },
+        "click_target": {
+            "type": "choice",
+            "criteria": {f"e{it['node']}": _describe_element(it) for it in clickable},
+            "instructions": "如果操作是 CLICK，应该点击下面哪一个元素？",
+        },
+    }
+    if typable:
+        questions["type_target"] = {
+            "type": "choice",
+            "criteria": {f"e{it['node']}": _describe_element(it) for it in typable},
+            "instructions": "如果操作是 TYPE_TEXT，应该往下面哪一个输入框输入？",
+        }
+
+    state = {
+        "goal": goal,
+        "page": {
+            "url": snapshot.get("url"),
+            "title": snapshot.get("title"),
+            # 只送视口内文本，且再截一刀，避免上下文被长页面撑爆
+            "text": (snapshot.get("pageText") or "")[:2000],
+        },
+    }
+    # 选项 key → 精简条目。key 用 e<node> 便于回译成 `sbc click --node`。
+    targets = {f"e{it['node']}": _lean_item(it) for it in clickable}
+    for it in typable:
+        targets[f"e{it['node']}"] = _lean_item(it)
+    return state, questions, targets, truncated
+
+
+# 决策器不可用时的统一提示：调用方走这条分支，下游动作不变
+DECISION_HINT = (
+    "用你自己的 LLM 在下面这份 elements 编号表上决策，"
+    "然后执行 sbc click --node <node> 或 sbc fill --node <node> --value <文本>"
+)
+
+# 可用性探测的缓存：CLI 每次调用都是新进程，缓存必须落盘
+DECIDER_STATE_PATH = Path(
+    os.getenv("STABLE_CHROME_DECIDER_STATE", str(Path.home() / ".stable-chrome" / "decider-state.json"))
+)
+DECIDER_OK_TTL_S = 600  # 探测通过后的信任窗口
+DECIDER_FAIL_TTL_S = 300  # 探测失败后的冷却期，避免每次都去撞同一堵墙
+DECIDER_PROBE_TIMEOUT_S = 8.0  # 探测本身要快，超了不如直接降级
+
+# 置信度三档：官方文档的 confidence-gated routing 模式
+CONFIDENCE_HIGH = 0.9
+CONFIDENCE_MEDIUM = 0.5
+
+
+def _load_decider_state() -> dict:
+    try:
+        return json.loads(DECIDER_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_decider_state(state: dict) -> None:
+    try:
+        DECIDER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DECIDER_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass  # 缓存写不进去不影响主流程
+
+
+def typesafe_ask(state: dict, questions: dict, timeout: float = 30.0) -> dict:
+    """调用 TypeSafe。失败时抛异常，由调用方归类。"""
+    key = os.environ["TYPESAFE_API_KEY"]
+    body = {"state": state, "model": TYPESAFE_MODEL, "questions": questions}
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        TYPESAFE_URL,
+        data=data,
+        method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8") or "{}")
+
+
+def _classify_decider_error(exc: Exception) -> tuple:
+    """把调用失败归类成 (reasonCode, permanent)。
+
+    permanent=True 表示确定性配置问题（key 无效 / 欠费 / 端点不存在），
+    短时间内重试没意义；False 表示可能是瞬时网络或服务抖动。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (401, 403):
+            return "invalid_key", True
+        if exc.code == 402:
+            return "quota_exhausted", True
+        if exc.code == 404:
+            return "endpoint_not_found", True
+        if exc.code == 429:
+            return "rate_limited", False
+        return f"http_{exc.code}", False
+    if isinstance(exc, urllib.error.URLError):
+        return "unreachable", False
+    if isinstance(exc, TimeoutError):
+        return "timeout", False
+    return f"error_{type(exc).__name__}", False
+
+
+def probe_decider(force: bool = False) -> dict:
+    """探测 JEV 是否**真的可用**，而不只是「环境变量存在」。
+
+    返回值 {available, reasonCode, detail, cached}。
+    结论落盘缓存：成功缓存 10 分钟，失败缓存 5 分钟 —— 这样一次不可用
+    不会让后续每次 decide 都白等一个超时。
+    """
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        return {
+            "available": False,
+            "reasonCode": "key_missing",
+            "detail": "TYPESAFE_API_KEY 未设置",
+            "cached": False,
+        }
+
+    now = time.time()
+    if not force:
+        cached_state = _load_decider_state()
+        age = now - float(cached_state.get("at") or 0)
+        ttl = DECIDER_OK_TTL_S if cached_state.get("available") else DECIDER_FAIL_TTL_S
+        if cached_state and age < ttl:
+            return {**cached_state, "cached": True}
+
+    # 用一个最小 noul 问题探测：同时验证鉴权、配额和网络可达性
+    try:
+        typesafe_ask(
+            {"probe": "health check"},
+            {"ok": {"type": "noul", "instructions": "Is this a health check?"}},
+            timeout=DECIDER_PROBE_TIMEOUT_S,
+        )
+        verdict = {"available": True, "reasonCode": "ok", "detail": "探测通过"}
+    except Exception as e:
+        code, permanent = _classify_decider_error(e)
+        verdict = {
+            "available": False,
+            "reasonCode": code,
+            "detail": f"{type(e).__name__}: {e}"[:200],
+            "permanent": permanent,
+        }
+    verdict["at"] = now
+    _save_decider_state(verdict)
+    return {**verdict, "cached": False}
+
+
+def confidence_gate(confidence: Optional[float]) -> tuple:
+    """把置信度翻成 (gate, recommendedAction)。"""
+    if not isinstance(confidence, (int, float)):
+        return "unknown", "recheck"
+    if confidence >= CONFIDENCE_HIGH:
+        return "high", "act"
+    if confidence >= CONFIDENCE_MEDIUM:
+        return "medium", "recheck"
+    return "low", "escalate"
+
+
+def _decision_degraded(
+    goal: str,
+    page: dict,
+    targets: dict,
+    truncated: int,
+    reason_code: str,
+    reason: str,
+    code: int,
+    candidate: Optional[dict] = None,
+) -> int:
+    """决策器给不出可用答案时的统一返回。
+
+    所有原因（没 key / key 无效 / 欠费 / 网络不通 / 置信度过低 / 主动跳过）
+    都返回**同一份编号表**，调用方只需要写一条降级分支，下游动作也完全一致
+    （都走 click --node / fill --node）。
+    """
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "decider": None,
+        "reasonCode": reason_code,
+        "reason": reason,
+        "hint": DECISION_HINT,
+        "goal": goal,
+        "page": page,
+        "elements": targets,
+        "truncated": truncated,
+    }
+    if candidate:
+        # 置信度过低时把原始判断也带上，调用方可以当参考
+        payload["candidate"] = candidate
+    return out(payload, code)
+
+
+def _node_from_choice(choice: Optional[str]) -> Optional[int]:
+    """把决策器选中的选项 key（如 "e12"）翻回元素编号。"""
+    if not choice or not str(choice).startswith("e"):
+        return None
+    try:
+        return int(str(choice)[1:])
+    except ValueError:
+        return None
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    params: Dict[str, Any] = {"max": args.max}
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    snap = run_cmd("snapshot", params, timeout_ms=30000)
+    if not snap.get("ok"):
+        return out(snap, 1)
+    snapshot = snap.get("result", {})
+
+    allowed = args.allow.split(",") if args.allow else None
+    state, questions, targets, truncated = build_decide_questions(snapshot, args.goal, allowed)
+    page = state["page"]
+
+    # ---- 1. 先判断决策器到底能不能用 ----
+    # 明确跳过（给没有 key 的同事，或做对照测试）
+    if getattr(args, "no_decider", False):
+        return _decision_degraded(
+            args.goal, page, targets, truncated,
+            "decider_disabled", "已用 --no-decider 主动跳过决策器", 2,
+        )
+
+    health = probe_decider(force=bool(getattr(args, "probe", False)))
+    if not health["available"]:
+        return _decision_degraded(
+            args.goal, page, targets, truncated,
+            health["reasonCode"],
+            f"JEV 不可用（{health['reasonCode']}）：{health['detail']}",
+            2,
+        )
+
+    # ---- 2. 真正决策 ----
+    started = time.time()
+    try:
+        raw = typesafe_ask(state, questions)
+    except Exception as e:
+        code, _ = _classify_decider_error(e)
+        # 这次失败要让下次重新探测，不能继续吃旧的「可用」缓存
+        _save_decider_state(
+            {"available": False, "reasonCode": code, "detail": f"{type(e).__name__}: {e}"[:200], "at": time.time()}
+        )
+        return _decision_degraded(
+            args.goal, page, targets, truncated,
+            code, f"JEV 调用失败（{code}）：{str(e)[:160]}", 2,
+        )
+
+    latency_ms = int((time.time() - started) * 1000)
+    answers = (raw or {}).get("answers") or {}
+    op = answers.get("operation") or {}
+    operation = op.get("choice")
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "decider": "jev",
+        "model": (raw or {}).get("model"),
+        "goal": args.goal,
+        "operation": operation,
+        "operationConfidence": op.get("confidence"),
+        "operationProbabilities": op.get("probabilities"),
+        "latencyMs": latency_ms,
+        "usage": (raw or {}).get("usage"),
+        "truncated": truncated,
+        "probeCached": health.get("cached", False),
+    }
+
+    target_confidence = None
+    if operation == "CLICK":
+        t = answers.get("click_target") or {}
+        choice = t.get("choice")
+        target = targets.get(choice) or {}
+        target_confidence = t.get("confidence")
+        result.update(
+            targetChoice=choice,
+            targetNode=_node_from_choice(choice),
+            targetName=target.get("name"),
+            targetRole=target.get("role"),
+            targetConfidence=target_confidence,
+            targetProbabilities=t.get("probabilities"),
+        )
+    elif operation == "TYPE_TEXT":
+        t = answers.get("type_target") or {}
+        choice = t.get("choice")
+        target = targets.get(choice) or {}
+        target_confidence = t.get("confidence")
+        result.update(
+            targetChoice=choice,
+            targetNode=_node_from_choice(choice),
+            targetName=target.get("name"),
+            targetRole=target.get("role"),
+            targetConfidence=target_confidence,
+            # 决策器只选目标，文字由调用方提供 —— JEV 不生成文本
+            needsText=True,
+        )
+
+    # ---- 3. 置信度分流 ----
+    # 取操作与目标里更低的那个：两个判断都得对，整条决策才可用
+    numeric = [
+        c for c in (op.get("confidence"), target_confidence) if isinstance(c, (int, float))
+    ]
+    effective = min(numeric) if numeric else None
+    gate, action = confidence_gate(effective)
+    result["effectiveConfidence"] = effective
+    result["confidenceGate"] = gate
+    result["recommendedAction"] = action
+
+    min_conf = getattr(args, "min_confidence", None)
+    if min_conf is not None and (effective is None or effective < min_conf):
+        return _decision_degraded(
+            args.goal, page, targets, truncated,
+            "low_confidence",
+            f"有效置信度 {effective} 低于阈值 {min_conf}（gate={gate}，建议 {action}）",
+            3,
+            candidate={
+                "operation": operation,
+                "targetNode": result.get("targetNode"),
+                "targetName": result.get("targetName"),
+                "effectiveConfidence": effective,
+            },
+        )
+
+    return out(result, 0)
+
 
 def cmd_claim(args: argparse.Namespace) -> int:
     # title 缺省用 Agent 任务；显式 --title 才覆盖
@@ -655,6 +1094,31 @@ def build_parser() -> argparse.ArgumentParser:
     sn.add_argument("--max", type=int, default=80)
     sn.add_argument("--tab-id")
     sn.set_defaults(func=cmd_snapshot)
+
+    dc = sub.add_parser(
+        "decide",
+        help="ask the optional decider which action to take next (needs TYPESAFE_API_KEY)",
+    )
+    dc.add_argument("--goal", required=True, help="natural-language task goal")
+    dc.add_argument(
+        "--allow",
+        help="comma-separated operation allowlist, e.g. CLICK,TYPE_TEXT,DONE",
+    )
+    dc.add_argument("--max", type=int, default=120, help="max elements to offer as targets")
+    dc.add_argument(
+        "--min-confidence",
+        type=float,
+        default=None,
+        help="exit 3 when the effective confidence is below this (caller should decide itself)",
+    )
+    dc.add_argument(
+        "--no-decider",
+        action="store_true",
+        help="skip the decider entirely and return the element table",
+    )
+    dc.add_argument("--probe", action="store_true", help="force a fresh availability probe")
+    dc.add_argument("--tab-id")
+    dc.set_defaults(func=cmd_decide)
 
     co = sub.add_parser("content", help="read page content summary")
     co.add_argument("--tab-id")

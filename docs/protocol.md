@@ -82,6 +82,20 @@
 | `waitFor` | 等待选择器 / 文本 |
 | `content` | 读取标题/URL/正文摘要 |
 
+## 决策层（可选，CLI 侧）
+
+`sbc decide --goal "..."` 不经过 Bridge —— 它先调 `snapshot`，再在 CLI 进程里完成决策。这样决策层换实现（JEV / 调用方自己的 LLM / 其他模型）都不需要动扩展。
+
+- **有 `TYPESAFE_API_KEY`**：把快照转成封闭选择题发给 TypeSafe，返回 `operation` + `targetNode` + 各选项概率与置信度。`operation` 取值为 `CLICK` / `TYPE_TEXT` / `SCROLL_UP` / `SCROLL_DOWN` / `WAIT` / `DONE`。
+- **没有 key**：exit code 2，返回 `{ ok: false, decider: null, elements: {...} }` —— 把本该喂给决策器的精简编号表交回调用方，由调用方的大模型决策。**这不是错误降级**：两条路径的下游完全一致（都执行 `click --node` / `fill --node`），只是决策耗时不同。
+
+两条约定：
+
+1. **一次请求并行问多个 head**（`operation` + `click_target` + `type_target`）。三个问题看的是同一份页面状态，猜错的支路直接忽略，不额外消耗往返。
+2. **选项基数上限 200**。JEV 的 Choice 基数上限是 255，超过要走两阶段打分，所以留出余量；超出部分计入返回值的 `truncated`。
+
+传给决策器的元素描述**不含 `guard`**——那是 click 做 stale 校验用的长指纹，含分隔符，放进决策上下文只会污染。
+
 ## 元素编号与页面缓存
 
 `snapshot` 会在页面的**扩展隔离世界**（ISOLATED world）上维护一份元素缓存：

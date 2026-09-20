@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Stable Chrome Attach",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Attach agents to real Chrome tabs with task tab groups. CDP screenshot + optional agent window, no focus steal. No CDP 9222 required.",
   "permissions": [
     "tabs",

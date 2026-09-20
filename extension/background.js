@@ -6,12 +6,23 @@
 const BRIDGE = 'http://127.0.0.1:19527';
 const POLL_WAIT_MS = 25000;
 const HELLO_EVERY_MS = 5000;
+// 长轮询最多等 POLL_WAIT_MS，超过这个时间没再往 bridge 要过命令就认定 loop 卡死。
+// 必须大于 POLL_WAIT_MS，否则正常的长轮询会被误判。
+const POLL_STALL_MS = 60000;
 const DEFAULT_TASK_TITLE = 'Agent 任务';
 const STATE_STORAGE_KEY = 'stableChromeTaskState';
 
 // SW 被 Chrome 挂起后，上下文重置，pollLoop 会停掉。
 // alarm 唤醒时用此标志判断是否需要重新启动。
+//
+// 注意：单靠这个布尔量不够 —— 如果 loop 卡在某个永不返回的 await 里，
+// _pollRunning 会一直是 true，alarm 的 `if (!_pollRunning)` 永远不成立，
+// 保活机制就被自己的防重入锁挡住了（实测踩过）。所以额外用
+// _pollTick 记录最后一次活动时间，超时即强制换新一代 loop。
 let _pollRunning = false;
+let _pollTick = 0;
+// 代际计数：卡死的旧 loop 恢复后会发现自己已被取代，自行退出，避免两个 loop 并存
+let _pollGen = 0;
 let _stateReady = null; // Promise：首次从 storage 恢复完成
 
 // Chrome tabGroups 支持的颜色（新建分组时轮换/随机，避免永远同一色）
@@ -265,26 +276,36 @@ function sleep(ms) {
 }
 
 async function bridgeFetch(path, options = {}) {
-  const res = await fetch(`${BRIDGE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  });
-  const text = await res.text();
-  let data;
+  // 必须带超时：长轮询一旦连接卡住而不返回，await 会永久挂起，
+  // pollLoop 就死在那里（保活也救不回来）。默认比长轮询多留 10s 余量。
+  const { timeoutMs = POLL_WAIT_MS + 10000, ...fetchOptions } = options;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`bridge non-json ${res.status}: ${text.slice(0, 200)}`);
+    const res = await fetch(`${BRIDGE}${path}`, {
+      ...fetchOptions,
+      signal: fetchOptions.signal || ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(fetchOptions.headers || {}),
+      },
+    });
+    const text = await res.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`bridge non-json ${res.status}: ${text.slice(0, 200)}`);
+    }
+    if (!res.ok && data?.ok === false) {
+      const err = new Error(data.error || `bridge http ${res.status}`);
+      err.payload = data;
+      throw err;
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok && data?.ok === false) {
-    const err = new Error(data.error || `bridge http ${res.status}`);
-    err.payload = data;
-    throw err;
-  }
-  return data;
 }
 
 async function hello() {
@@ -1042,6 +1063,66 @@ function scanPage(opts) {
           height: item.height,
         });
       }
+    }
+  }
+
+  // ===== 兜底：无 role 的自定义控件 =====
+  // 现代前端框架的自定义下拉/菜单常常是纯 div/span，不带任何 role，
+  // 只按 role 采集会整个漏掉（实测某后台的时间维度菜单就是这种结构）。
+  // 这里补扫「指针光标 + 叶子节点」作为启发式候选，并加硬上限控制开销：
+  // 先做便宜判断，只有通过筛选的元素才算 getComputedStyle。
+  const FALLBACK_MAX = 20;
+  const FALLBACK_SCAN_MAX = 3000;
+  let scanned = 0;
+  let fallbackCount = 0;
+  if (items.length < maxResults) {
+    for (const el of document.querySelectorAll('*')) {
+      if (fallbackCount >= FALLBACK_MAX || scanned >= FALLBACK_SCAN_MAX) break;
+      if (items.length >= maxResults) break;
+      scanned += 1;
+      // 有 role 的元素归主循环管，这里只管没有 role 的
+      if (roleOf(el)) continue;
+      if (el.children.length !== 0) continue;
+      const rawText = (el.textContent || '').trim();
+      if (!rawText || rawText.length > 60) continue;
+      if (['password', 'file', 'hidden'].includes(el.type)) continue;
+      const fr = el.getBoundingClientRect();
+      if (fr.width < 8 || fr.height < 8) continue;
+      if (fr.bottom < 0 || fr.right < 0 || fr.top > innerHeight || fr.left > innerWidth) continue;
+      if (!visible(el)) continue;
+      // 到这里候选已经很少了，再算样式
+      if (getComputedStyle(el).cursor !== 'pointer') continue;
+
+      fallbackCount += 1;
+      const label = rawText.replace(/\s+/g, ' ').slice(0, 120);
+      const item = {
+        node: identity(el),
+        index: items.length,
+        tag: el.tagName.toLowerCase(),
+        // 用 clickable 而不是 button：不谎报语义，调用方要按启发式对待
+        role: 'clickable',
+        name: label,
+        text: label,
+        type: el.getAttribute('type'),
+        value: 'value' in el ? String(el.value === undefined ? '' : el.value) : '',
+        href: el.getAttribute('href'),
+        placeholder: el.getAttribute('placeholder'),
+        selector: selectorOf(el),
+        disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+        readOnly: Boolean(el.readOnly) || el.getAttribute('aria-readonly') === 'true',
+        // 明确标注这是启发式条目，不是按 role 采集到的
+        heuristic: true,
+        x: Math.round(fr.x),
+        y: Math.round(fr.y),
+        width: Math.round(fr.width),
+        height: Math.round(fr.height),
+      };
+      if (withGuards) {
+        const guard = guardOf(el);
+        item.guard = guard;
+        if (guard !== null) cache.guards.set(item.node, guard);
+      }
+      items.push(item);
     }
   }
 
@@ -1984,10 +2065,18 @@ async function postResult(id, ok, result, error) {
 }
 
 async function pollLoop() {
-  if (_pollRunning) return; // 防重入
+  // 防重入，但如果上一次已经卡死超过 POLL_STALL_MS，就放行并换新一代 loop。
+  // 旧 loop 恢复后会在下一次循环条件里发现 gen 不匹配，自行退出。
+  if (_pollRunning && Date.now() - _pollTick < POLL_STALL_MS) return;
+  if (_pollRunning) {
+    console.warn('[stable-chrome] pollLoop 卡住超过', POLL_STALL_MS, 'ms，强制换新 loop');
+  }
+  const gen = ++_pollGen;
   _pollRunning = true;
-  console.log('[stable-chrome] pollLoop started');
-  while (!state.pollAbort) {
+  _pollTick = Date.now();
+  console.log('[stable-chrome] pollLoop started gen=', gen);
+  while (!state.pollAbort && gen === _pollGen) {
+    _pollTick = Date.now();
     try {
       await hello();
       const data = await bridgeFetch(`/ext/poll?waitMs=${POLL_WAIT_MS}`, { method: 'GET' });
@@ -2008,7 +2097,7 @@ async function pollLoop() {
       await sleep(1500);
     }
   }
-  _pollRunning = false;
+  if (gen === _pollGen) _pollRunning = false;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -2024,11 +2113,10 @@ chrome.alarms.create('stable-chrome-keepalive', { periodInMinutes: 0.25 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'stable-chrome-keepalive') {
     hello().catch(() => {});
-    // SW 被 suspend 后上下文重置，_pollRunning 归 false，重新启动 loop
-    if (!_pollRunning) {
-      console.log('[stable-chrome] alarm revived pollLoop');
-      pollLoop();
-    }
+    // 无条件调用：pollLoop 自己判断是「还在正常跑」还是「已卡死需要换新」。
+    // 早先这里写 `if (!_pollRunning)`，结果 loop 卡在 await 里时该判断恒不成立，
+    // 保活反而彻底失效。
+    pollLoop();
   }
 });
 

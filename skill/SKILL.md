@@ -79,6 +79,7 @@ sbc end-task
 | `sbc fill --node|--index|--selector --value` | 输入；和 `click` 一样支持 `--node` 定位。checkbox/radio 请用 `click` 切换 |
 | `sbc eval 'document.title'` | 执行 JS |
 | `sbc snapshot [--max N]` | 可见可交互元素，含稳定编号/可访问名称/元素状态 |
+| `sbc decide --goal "..."` | 可选决策层：有 `TYPESAFE_API_KEY` 时用 JEV 选下一步操作+目标；没有则返回编号表交回调用方决策 |
 | `sbc content` | 读正文摘要 |
 | `sbc cookie-get [--name NAME] [--url URL]` | 读 cookie（**含 HttpOnly**，走 CDP，不需要 cookies 权限）；输出含明文值 |
 | `sbc wait --text|--selector` | 等待 |
@@ -120,7 +121,57 @@ sbc end-task
 
 **已经过滤掉的**（不会出现在结果里）：`disabled` / `aria-disabled` 元素、`display:none` / `visibility:hidden` / `opacity:0` / `aria-hidden` / `inert` 元素、小于 5px 的元素、视口外的元素。
 
+**兜底采集**：很多现代前端框架的自定义下拉/菜单是纯 `div`/`span`、**不带任何 `role`**，只按 role 采集会整片漏掉。扫描器会补扫一轮「`cursor: pointer` + 叶子节点」的元素，标记成 `role: "clickable"` 并带 `heuristic: true`。
+
+**看到 `heuristic: true` 就要按启发式对待**——它们是靠样式猜出来的可点元素，不像 `button`/`link` 那样有明确语义。数量有硬上限（单次最多 20 个，扫描节点数上限 3000），不会因为页面巨大而拖慢。
+
 **只收录视口内的元素**——想操作页面下方的元素，先看 `scroll.canScrollDown`，需要时 `sbc eval 'window.scrollBy(0,600)'` 再快照。
+
+## 决策层（可选）
+
+`sbc decide --goal "..."` 把「下一步点哪里」从「大模型写选择器」换成「在封闭选项里选一个」。
+
+**它是可选的加速器，不是依赖**：
+
+```bash
+# 配了 TYPESAFE_API_KEY：走 JEV，返回 operation + targetNode + 置信度
+sbc decide --goal "点击登录按钮"
+
+# 没配：把本该喂给决策器的编号表原样交回，exit code 2
+sbc decide --goal "点击登录按钮"
+```
+
+没有 key 时的输出长这样——**不是报错，是给你一份可以直接决策的输入**：
+
+```json
+{
+  "ok": false,
+  "decider": null,
+  "reason": "TYPESAFE_API_KEY 未设置，没有可用的 JEV 决策器",
+  "hint": "用你自己的 LLM 在下面这份 elements 编号表上决策，然后执行 sbc click --node <node>",
+  "goal": "...",
+  "page": { "url": "...", "title": "...", "text": "视口内文本" },
+  "elements": { "e11": { "node": 11, "role": "button", "name": "正常按钮", ... } }
+}
+```
+
+有 key 时返回：
+
+```json
+{
+  "ok": true, "decider": "jev", "model": "jev-1.13.0",
+  "operation": "CLICK",              // CLICK | TYPE_TEXT | SCROLL_UP | SCROLL_DOWN | WAIT | DONE
+  "operationConfidence": 0.99,
+  "targetNode": 11, "targetName": "正常按钮", "targetConfidence": 1.0,
+  "latencyMs": 1510, "usage": { "input_tokens": 1008, "output_tokens": 145 }
+}
+```
+
+拿到 `targetNode` 后执行 `sbc click --node <targetNode>`；`operation` 是 `TYPE_TEXT` 时返回 `needsText: true`——**决策器只选目标，文字由调用方提供**（JEV 不生成文本）。
+
+**为什么要这样设计**：有 JEV 和没 JEV 的人用同一套工具、同一套下游（都走 `click --node`），只是决策速度不同。哪天拿到 key，加一个环境变量就生效，调用方代码不用改。
+
+调用的两个约定：一次请求同时问 `operation` / `click_target` / `type_target`（并行返回，猜错的分支直接忽略，不浪费往返）；选项基数上限 200（JEV 的 Choice 上限是 255，超过要走两阶段打分）。
 
 ## 硬规则
 
