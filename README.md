@@ -307,7 +307,7 @@ CLI/Skill → local Bridge (`http://127.0.0.1:19527`) → Chrome MV3 extension l
 ### macOS / Linux / Windows
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/stable-chrome.git
+git clone https://github.com/zhangyinglong3550/stable-chrome.git
 cd stable-chrome
 python3 cli/sbc setup          # Windows: python cli\sbc setup
 ```
