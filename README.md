@@ -178,7 +178,7 @@ python3 cli/sbc setup        # 重新同步 SKILL.md 到各 Agent 目录
 | `sbc doctor` | 完整诊断（Bridge + 扩展） |
 | `sbc open-tabs` | 列出真实 Chrome 标签 |
 | `sbc start-task --title NAME` | 创建任务标签分组 |
-| `sbc end-task [--close-group]` | 结束任务 |
+| `sbc end-task [--close-group] [--close-tabs]` | 结束任务；默认分组和标签都保留，`--close-group` 解散分组，`--close-tabs` 真正关闭组内页面 |
 | `sbc claim [--tab-id ID]` | 接管标签并入任务组 |
 | `sbc new-tab --url URL` | 任务组内开页（默认复用单标签） |
 | `sbc goto URL [--tab-id ID]` | 导航 |

@@ -206,6 +206,24 @@ def test_role_less_controls_are_collected_as_fallback():
     assert "if (roleOf(el)) continue;" in source
 
 
+def test_end_task_close_tabs_really_closes():
+    """--close-tabs 要真的关闭组内标签，且只关任务组的，不碰用户自己的标签。"""
+    source = BACKGROUND.read_text()
+    assert "async function endTask(closeGroup = false, closeTabs = false)" in source
+    assert "if ((closeGroup || closeTabs) && groupId != null)" in source
+    assert "await chrome.tabs.remove(tab.id);" in source
+    # 只按 groupId 过滤任务组，用户的其它分组不受影响
+    assert "tab.groupId === groupId" in source
+    # close-tabs 关闭，close-group 解散，两者是不同动作
+    assert "if (closeTabs) {" in source
+    assert "await chrome.tabs.ungroup(tab.id);" in source
+    cli = CLI.read_text()
+    assert '"--close-tabs"' in cli
+    assert '"closeTabs": bool(args.close_tabs)' in cli
+    # --close-group 的语义要在帮助里写清：解散分组、保留标签
+    assert "解散分组" in cli
+
+
 def test_decider_accepts_the_heuristic_role():
     """兜底采集出来的 clickable 必须能进决策候选，否则等于白采。"""
     cli = CLI.read_text()

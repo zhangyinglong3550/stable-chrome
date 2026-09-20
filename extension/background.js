@@ -552,15 +552,22 @@ async function startTask(title, params = {}) {
   };
 }
 
-async function endTask(closeGroup = false) {
+async function endTask(closeGroup = false, closeTabs = false) {
   state.taskActive = false;
   const groupId = state.taskGroupId;
-  if (closeGroup && groupId != null) {
+  if ((closeGroup || closeTabs) && groupId != null) {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       if (tab.groupId === groupId && tab.id != null) {
         try {
-          await chrome.tabs.ungroup(tab.id);
+          if (closeTabs) {
+            // 真正关闭页面：任务确认完成后回收手段型标签页。
+            // 关掉组内全部标签后 Chrome 会自动解散空分组。
+            await chrome.tabs.remove(tab.id);
+          } else {
+            // 只解散分组，标签保留（散落回窗口）——默认的安全行为
+            await chrome.tabs.ungroup(tab.id);
+          }
         } catch {}
       }
     }
@@ -579,7 +586,7 @@ async function endTask(closeGroup = false) {
   state.taskWindowId = null;
   state.preferTaskWindow = false;
   await persistTaskState();
-  return { ended: true, closedGroup: Boolean(closeGroup), previousGroupId: groupId };
+  return { ended: true, closedGroup: Boolean(closeGroup), closedTabs: Boolean(closeTabs), previousGroupId: groupId };
 }
 
 /** 热重载扩展自身（加载磁盘上最新 background.js）。调用后 SW 会短暂离线再上线。 */
@@ -2006,7 +2013,7 @@ async function handleCommand(cmd) {
     case 'startTask':
       return startTask(params.title, params);
     case 'endTask':
-      return endTask(Boolean(params.closeGroup));
+      return endTask(Boolean(params.closeGroup), Boolean(params.closeTabs));
     case 'reloadExtension':
       return reloadExtension();
     case 'setGroupTitle':

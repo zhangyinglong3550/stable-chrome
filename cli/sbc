@@ -760,7 +760,10 @@ def cmd_start_task(args: argparse.Namespace) -> int:
 
 
 def cmd_end_task(args: argparse.Namespace) -> int:
-    r = run_cmd("endTask", {"closeGroup": bool(args.close_group)})
+    r = run_cmd(
+        "endTask",
+        {"closeGroup": bool(args.close_group), "closeTabs": bool(args.close_tabs)},
+    )
     return out(r, 0 if r.get("ok") else 1)
 
 
@@ -1020,7 +1023,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_start_task)
 
     e = sub.add_parser("end-task", help="end task")
-    e.add_argument("--close-group", action="store_true")
+    e.add_argument("--close-group", action="store_true", help="解散分组（组内标签保留，散落回窗口）")
+    e.add_argument(
+        "--close-tabs",
+        action="store_true",
+        help="关闭组内全部标签（任务确认完成、页面只是手段时用）；分组随之消失",
+    )
     e.set_defaults(func=cmd_end_task)
 
     sub.add_parser(

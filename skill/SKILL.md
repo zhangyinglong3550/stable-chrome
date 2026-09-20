@@ -84,7 +84,7 @@ sbc end-task
 | `sbc cookie-get [--name NAME] [--url URL]` | 读 cookie（**含 HttpOnly**，走 CDP，不需要 cookies 权限）；输出含明文值 |
 | `sbc wait --text|--selector` | 等待 |
 | `sbc screenshot --out` | 截图（优先 CDP `Page.captureScreenshot`，不切标签；失败才降级） |
-| `sbc end-task [--close-group]` | 结束任务 |
+| `sbc end-task [--close-group] [--close-tabs]` | 结束任务；默认分组和标签都保留，`--close-group` 解散分组（标签散落回窗口），`--close-tabs` 真正关闭组内页面 |
 | `sbc net-start [--tab-id]` | 开始 CDP 网络捕获 |
 | `sbc net-get [--tab-id] [--grep STR]` | 读取捕获的 API 请求（不停止） |
 | `sbc net-stop [--tab-id] [--grep STR]` | 停止捕获并输出所有请求 |
@@ -173,6 +173,27 @@ sbc decide --goal "点击登录按钮"
 
 调用的两个约定：一次请求同时问 `operation` / `click_target` / `type_target`（并行返回，猜错的分支直接忽略，不浪费往返）；选项基数上限 200（JEV 的 Choice 上限是 255，超过要走两阶段打分）。
 
+## 任务生命周期（分组什么时候关）
+
+**默认永不自动关闭** —— Agent 不该静默关掉用户可能还要看的页面。要关，必须满足「确定完成」：
+
+推荐约定（配合决策层）：
+
+| 阶段 | 动作 |
+|---|---|
+| 开任务 | `sbc start-task`（建分组） |
+| 每步 | `sbc snapshot` → `sbc decide` → 按 `recommendedAction` 执行 |
+| decide 返回 `DONE` 且 gate=high | **先独立验证**——检查页面上真的出现了目标状态。模型说完成不算数 |
+| 验证通过 | `sbc end-task --close-group`（解散分组，标签保留） |
+| 页面只是手段、确定没用了 | `sbc end-task --close-tabs`（真正关闭组内页面，分组随之消失） |
+
+**两类任务要区分**：
+
+- **手段型**（页面只是工具：查个数、点个按钮、填个表单）→ 完成后 `--close-tabs` 合理
+- **交付型**（页面本身就是结果：仪表盘、调试环境、留给用户看的页面）→ **永远不要自动关**
+
+就算忘了收尾也无妨——分组积累不影响任何功能，定期人工清理即可。
+
 ## 硬规则
 
 1. **禁止**默认使用 9222 / 复制 profile / 匿名 Chromium 冒充连接成功
@@ -207,6 +228,9 @@ sbc doctor
 # 改完 extension 后：sbc reload-extension（或 chrome://extensions 点重新加载）
 # 未安装：python3 cli/sbc setup
 ```
+
+**所有命令超时、但 doctor 显示扩展在线**  
+轮询循环卡死了（心跳还在发，但不再取命令——`/doctor` 里 `queueSize` 会持续增长）。重载扩展即可恢复；**v0.2.0 起内置停滞看门狗，卡住 60 秒自动换新轮询循环，无需人工干预**。
 
 ## 实现路径
 安装后在仓库根目录找到对应文件：
