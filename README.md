@@ -165,7 +165,7 @@ python3 cli/sbc setup        # 重新同步 SKILL.md 到各 Agent 目录
 
 然后到 `chrome://extensions/` 点 stable-chrome 的 🔄 **重新加载** —— 扩展代码变了，MV3 **不会自动热更新**。
 
-**验证**：`python3 cli/sbc doctor` 输出里的 `version` 应为 `0.2.1`；skill 是否同步可对比 `skill/SKILL.md` 与 `~/.claude/skills/stable-chrome/SKILL.md`。
+**验证**：`python3 cli/sbc doctor` 输出里的 `version` 应为 `0.2.2`；skill 是否同步可对比 `skill/SKILL.md` 与 `~/.claude/skills/stable-chrome/SKILL.md`。
 
 ---
 
@@ -179,7 +179,7 @@ python3 cli/sbc setup        # 重新同步 SKILL.md 到各 Agent 目录
 | `sbc open-tabs` | 列出真实 Chrome 标签 |
 | `sbc start-task --title NAME [--keep]` | 创建/复用任务标签分组。`--keep` 的页面不参与 10 分钟空闲回收 |
 | `sbc end-task [--keep]` | 结束任务。**默认关闭本任务打开的标签**；`--keep` 留下；`--close-group` 只解散分组 |
-| `sbc sweep [--dry-run]` | 关掉 `sbc · …` 和旧的「Agent 任务」分组。`--include-keep` 连保留页一起关 |
+| `sbc sweep [--dry-run]` | 关掉 Agent 留下的标签组。`--include-keep` 连保留页一起关 |
 | `sbc claim [--tab-id ID]` | 接管标签并入任务组 |
 | `sbc new-tab --url URL` | 任务组内开页（默认复用单标签） |
 | `sbc goto URL [--tab-id ID]` | 导航 |

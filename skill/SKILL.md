@@ -86,7 +86,7 @@ sbc end-task                              # 默认关掉本任务打开的标签
 | `sbc wait --text|--selector` | 等待 |
 | `sbc screenshot --out` | 截图（优先 CDP `Page.captureScreenshot`，不切标签；失败才降级） |
 | `sbc end-task [--keep] [--close-tabs] [--close-group]` | 结束任务。**默认关闭本任务打开的标签**；`--keep` 留下并免除回收；`--close-group` 只解散分组、标签还在 |
-| `sbc sweep [--dry-run] [--include-keep]` | 关掉标题为 `sbc · …` 或 `Agent 任务` 的分组。先 `--dry-run` 看清单。`--keep` 的组默认跳过 |
+| `sbc sweep [--dry-run] [--include-keep]` | 关掉 Agent 留下的标签组。先 `--dry-run` 看清单。`--keep` 的组默认跳过 |
 | `sbc net-start [--tab-id]` | 开始 CDP 网络捕获 |
 | `sbc net-get [--tab-id] [--grep STR]` | 读取捕获的 API 请求（不停止） |
 | `sbc net-stop [--tab-id] [--grep STR]` | 停止捕获并输出所有请求 |
@@ -177,11 +177,11 @@ sbc decide --goal "点击登录按钮"
 
 ## 任务生命周期（分组什么时候关）
 
-扩展自己回收 Agent 打开的页面，不靠会话记得调用关闭。分组标题一律是 `sbc · <任务名>`。
+扩展自己回收 Agent 打开的页面，不靠会话记得调用关闭。分组标题就是任务名（默认 `Agent 任务`），不再加前缀。用户自己不开分组，所以标签组都算 Agent 留下的，归属记在扩展账本里。
 
 | 阶段 | 动作 |
 |---|---|
-| 开任务 | `sbc start-task`（复用同一个 Agent 窗口；分组前缀 `sbc ·`） |
+| 开任务 | `sbc start-task`（复用同一个 Agent 窗口） |
 | 页面要留给人看 | `sbc start-task --keep` 或结束时 `sbc end-task --keep` |
 | 每步 | `sbc snapshot` → `sbc decide` → 按返回的操作执行 |
 | decide 返回 `DONE` | **先独立验证**页面上真的到了目标状态，再 `sbc end-task` |
@@ -194,11 +194,8 @@ sbc decide --goal "点击登录按钮"
 - 钉住的标签
 - 用户从外面拖进任务组、不是本任务创建的标签
 - `--keep` 的分组
-- 标题不是 `sbc · …` 也不是 `Agent 任务` 的分组
 
-**空闲回收：**本任务的分组超过 10 分钟没有命令、用户也没有再打开其中的标签，扩展会关掉它。满 5 分钟先折叠，标题加上 `· 待关闭`。下一条命令会把它展开。忘了 `end-task` 也会收掉，不用再人工清。
-
-升级前已经留下的「Agent 任务」分组不会被闹钟突然关掉。用 `sbc sweep` 清。自定义标题的旧分组认不出主人，sweep 不会动。
+**空闲回收：**标签组超过 10 分钟没有命令、用户也没有再打开其中的标签，扩展会关掉它。满 5 分钟先折叠，不改组名。下一条命令会把它展开。忘了 `end-task` 也会收掉。重载扩展后，旧版本写在组名前面的标记会自动去掉。
 
 ## 硬规则
 

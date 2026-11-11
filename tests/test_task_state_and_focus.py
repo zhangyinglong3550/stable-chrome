@@ -94,7 +94,11 @@ def test_group_lease_reaps_only_owned_agent_tabs():
     source = BACKGROUND.read_text()
     cli = CLI.read_text()
     skill = (Path(__file__).parents[1] / "skill" / "SKILL.md").read_text()
-    assert "GROUP_TITLE_PREFIX = 'sbc · '" in source
+    assert "LEGACY_GROUP_PREFIX = 'sbc · '" in source
+    assert "GROUP_TITLE_PREFIX" not in source
+    assert "function formatGroupTitle" in source
+    assert "async function normalizeLegacyGroupTitles" in source
+    assert "用户自己不开分组" in source
     assert "IDLE_TTL_MS = 10 * 60 * 1000" in source
     assert "IDLE_WARN_MS = 5 * 60 * 1000" in source
     assert "async function reapIdleGroups" in source
@@ -104,8 +108,7 @@ def test_group_lease_reaps_only_owned_agent_tabs():
     assert "adoptedTabIds" in source
     assert "dockWindowId" in source
     assert "不关闭就不失忆" in source
-    # 升级前的「Agent 任务」只走 sweep，不进闹钟回收
-    assert "升级前已堆着的「Agent 任务」只交给 sbc sweep" in source
+    assert "sbc ·" not in skill
     assert '"--keep"' in cli
     assert "def cmd_sweep" in cli
     assert '"--dry-run"' in cli

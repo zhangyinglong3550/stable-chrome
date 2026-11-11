@@ -1061,7 +1061,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     e.set_defaults(func=cmd_end_task)
 
-    sw = sub.add_parser("sweep", help="close idle agent tab groups (sbc · / Agent 任务)")
+    sw = sub.add_parser("sweep", help="close agent tab groups left behind")
     sw.add_argument("--dry-run", action="store_true", help="只列出将关闭的分组，不关")
     sw.add_argument(
         "--include-keep",

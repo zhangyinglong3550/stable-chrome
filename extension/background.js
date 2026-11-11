@@ -12,8 +12,9 @@ const POLL_STALL_MS = 60000;
 const DEFAULT_TASK_TITLE = 'Agent 任务';
 const STATE_STORAGE_KEY = 'stableChromeTaskState';
 const LEDGER_KEY = 'stableChromeGroupLedger';
-const GROUP_TITLE_PREFIX = 'sbc · ';
-const CLOSING_SUFFIX = ' · 待关闭';
+// 0.2.1 把归属写进组名。用户自己不开分组，归属改记账本；这两段只用于把已经写上的组名剥掉。
+const LEGACY_GROUP_PREFIX = 'sbc · ';
+const LEGACY_CLOSING_SUFFIX = ' · 待关闭';
 // 手段页租约：10 分钟没有任何命令、用户也没再看这个组，就回收。
 const IDLE_TTL_MS = 10 * 60 * 1000;
 const IDLE_WARN_MS = 5 * 60 * 1000;
@@ -122,24 +123,19 @@ async function loadPersistedTaskState() {
 
 function logicalTitle(title) {
   let t = String(title || '').trim();
-  if (t.startsWith(GROUP_TITLE_PREFIX)) t = t.slice(GROUP_TITLE_PREFIX.length);
-  if (t.endsWith(CLOSING_SUFFIX)) t = t.slice(0, -CLOSING_SUFFIX.length);
+  if (t.startsWith(LEGACY_GROUP_PREFIX)) t = t.slice(LEGACY_GROUP_PREFIX.length);
+  if (t.endsWith(LEGACY_CLOSING_SUFFIX)) t = t.slice(0, -LEGACY_CLOSING_SUFFIX.length);
   t = t.trim();
   return t || DEFAULT_TASK_TITLE;
 }
 
-function formatGroupTitle(title, closing) {
-  const core = `${GROUP_TITLE_PREFIX}${logicalTitle(title)}`;
-  return closing ? `${core}${CLOSING_SUFFIX}` : core;
+function formatGroupTitle(title) {
+  return logicalTitle(title);
 }
 
-/** 能安全认领的旧分组：新前缀，或升级前的默认标题「Agent 任务」。自定义标题不动。 */
-function isSweepableTitle(title) {
+function titleNeedsCleanup(title) {
   const t = String(title || '').trim();
-  if (!t) return false;
-  if (t.startsWith(GROUP_TITLE_PREFIX)) return true;
-  const bare = t.endsWith(CLOSING_SUFFIX) ? t.slice(0, -CLOSING_SUFFIX.length).trim() : t;
-  return bare === DEFAULT_TASK_TITLE;
+  return t.startsWith(LEGACY_GROUP_PREFIX) || t.endsWith(LEGACY_CLOSING_SUFFIX);
 }
 
 function rememberOwned(tabId) {
@@ -301,6 +297,32 @@ function clearActiveTaskPointer() {
   state.keep = false;
 }
 
+/** 用户自己不开分组，所以每个标签组都是 Agent 留下的。组名只留任务名。 */
+async function normalizeLegacyGroupTitles() {
+  let groups = [];
+  try {
+    groups = await chrome.tabGroups.query({});
+  } catch {
+    return;
+  }
+  const live = new Set();
+  for (const g of groups) {
+    live.add(String(g.id));
+    if (!titleNeedsCleanup(g.title)) continue;
+    try {
+      await chrome.tabGroups.update(g.id, { title: logicalTitle(g.title) });
+    } catch {}
+  }
+  let dropped = false;
+  for (const key of Object.keys(ledger.groups)) {
+    if (!live.has(key)) {
+      delete ledger.groups[key];
+      dropped = true;
+    }
+  }
+  if (dropped) await persistLedger();
+}
+
 async function groupLastSeen(groupId, rec) {
   let seen = Number(rec?.lastTouchedAt) || 0;
   try {
@@ -312,6 +334,7 @@ async function groupLastSeen(groupId, rec) {
 
 async function reapIdleGroups() {
   await loadLedger();
+  await normalizeLegacyGroupTitles();
   const now = Date.now();
   let groups = [];
   try {
@@ -321,37 +344,37 @@ async function reapIdleGroups() {
   }
   const reaped = [];
   for (const g of groups) {
-    const key = String(g.id);
-    const rec = ledger.groups[key];
-    const managedTitle = String(g.title || '').trim().startsWith(GROUP_TITLE_PREFIX);
-    // 升级前已堆着的「Agent 任务」只交给 sbc sweep，不在闹钟里突然关掉。
-    if (!rec && !managedTitle) continue;
-    // 用户改掉了 sbc 前缀，当成要留下。
-    if (rec && !isSweepableTitle(g.title)) {
-      rec.keep = true;
-      continue;
-    }
+    const rec = ledger.groups[String(g.id)];
     if (rec?.keep) continue;
     const seen = await groupLastSeen(g.id, rec);
-    if (!seen) continue;
+    // 重启后账本对不上组 id：从第一次看见开始算 10 分钟，避免刚打开就关。
+    if (!seen) {
+      await upsertLedger(g.id, {
+        title: logicalTitle(g.title),
+        lastTouchedAt: now,
+        keep: false,
+      });
+      continue;
+    }
     const age = now - seen;
     if (age >= IDLE_TTL_MS) {
       const outcome = await closeOwnedTabsInGroup(g.id, rec || { ownedTabIds: [], adoptedTabIds: [] });
       if (state.taskGroupId === g.id && outcome.remaining === 0) clearActiveTaskPointer();
       // 剩下的都是钉住或用户标签：别每 15 秒再试一次。
       if (outcome.remaining > 0 && outcome.closed.length === 0) {
-        const left = ledger.groups[String(g.id)];
-        if (left) left.keep = true;
+        await upsertLedger(g.id, {
+          title: logicalTitle(rec?.title || g.title),
+          keep: true,
+          ownedTabIds: rec?.ownedTabIds || [],
+          adoptedTabIds: rec?.adoptedTabIds || [],
+        });
       }
       await closeDockIfEmpty();
-      reaped.push({ groupId: g.id, title: g.title, ...outcome });
-    } else if (age >= IDLE_WARN_MS) {
-      const nextTitle = formatGroupTitle(rec?.title || g.title, true);
-      if (g.title !== nextTitle || !g.collapsed) {
-        try {
-          await chrome.tabGroups.update(g.id, { title: nextTitle, collapsed: true });
-        } catch {}
-      }
+      reaped.push({ groupId: g.id, title: logicalTitle(g.title), ...outcome });
+    } else if (age >= IDLE_WARN_MS && !g.collapsed) {
+      try {
+        await chrome.tabGroups.update(g.id, { collapsed: true });
+      } catch {}
     }
   }
   await persistLedger();
@@ -371,7 +394,6 @@ async function sweepGroups(params = {}) {
   }
   const plan = [];
   for (const g of groups) {
-    if (!isSweepableTitle(g.title)) continue;
     const rec = ledger.groups[String(g.id)];
     const kept = Boolean(rec?.keep);
     if (kept && !includeKeep && !dryRun) continue;
@@ -395,7 +417,7 @@ async function sweepGroups(params = {}) {
     return {
       dryRun: true,
       groups: plan,
-      note: '只列出标题为「sbc · …」或「Agent 任务」的分组。keep 为 true 的要加 --include-keep 才会关。自定义标题的旧分组不会动。',
+      note: '列出全部标签组（用户自己不开分组，组都是 Agent 留下的）。keep 为 true 的要加 --include-keep 才会关。钉住的标签和 claim 来的原标签会留下。',
     };
   }
   const results = [];
@@ -421,7 +443,7 @@ async function touchLease() {
   await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
   try {
     const g = await chrome.tabGroups.get(state.taskGroupId);
-    const next = formatGroupTitle(state.taskTitle, false);
+    const next = formatGroupTitle(state.taskTitle);
     if (g && (g.title !== next || g.collapsed)) {
       await chrome.tabGroups.update(state.taskGroupId, { title: next, collapsed: false });
     }
@@ -629,6 +651,7 @@ function ensureStateReady() {
       await loadPersistedTaskState();
       await loadLedger();
       await reconcileTaskState();
+      await normalizeLegacyGroupTitles();
     })();
   }
   return _stateReady;
@@ -745,7 +768,7 @@ async function listOpenTabs() {
 async function ensureTaskGroup(tabId, title, preferredColor) {
   if (title) state.taskTitle = logicalTitle(title);
   const tab = await chrome.tabs.get(tabId);
-  const shown = formatGroupTitle(state.taskTitle, false);
+  const shown = formatGroupTitle(state.taskTitle);
 
   // 1) 已有「本任务」分组：只把标签移入，绝不改名用户其它组
   if (state.taskGroupId != null) {
@@ -2460,7 +2483,7 @@ async function dispatchCommand(type, params) {
       if (state.taskGroupId == null) throw new Error('no task group');
       state.taskTitle = logicalTitle(params.title || state.taskTitle);
       await chrome.tabGroups.update(state.taskGroupId, {
-        title: formatGroupTitle(state.taskTitle, false),
+        title: formatGroupTitle(state.taskTitle),
         collapsed: false,
       });
       await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
@@ -2573,6 +2596,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       .catch((e) => console.warn('[stable-chrome] reapIdleGroups', e));
   }
 });
+
+// 启动时先剥掉旧组名前缀，并按租约回收已经闲置的组。不必等 15 秒闹钟。
+ensureStateReady()
+  .then(() => reapIdleGroups())
+  .catch((e) => console.warn('[stable-chrome] startup reap', e));
 
 // start poll loop
 pollLoop();
