@@ -209,8 +209,8 @@ def test_role_less_controls_are_collected_as_fallback():
 def test_end_task_close_tabs_really_closes():
     """--close-tabs 要真的关闭组内标签，且只关任务组的，不碰用户自己的标签。"""
     source = BACKGROUND.read_text()
-    assert "async function endTask(closeGroup = false, closeTabs = false)" in source
-    assert "if ((closeGroup || closeTabs) && groupId != null)" in source
+    assert "async function endTask(closeGroup = false, closeTabs = false, keep = false)" in source
+    assert "if ((closeGroup || closeTabs) && groupId != null && !keep)" in source
     assert "await chrome.tabs.remove(tab.id);" in source
     # 只按 groupId 过滤任务组，用户的其它分组不受影响
     assert "tab.groupId === groupId" in source
@@ -219,7 +219,8 @@ def test_end_task_close_tabs_really_closes():
     assert "await chrome.tabs.ungroup(tab.id);" in source
     cli = CLI.read_text()
     assert '"--close-tabs"' in cli
-    assert '"closeTabs": bool(args.close_tabs)' in cli
+    assert '"closeTabs": close_tabs' in cli
+    assert "close_tabs = True" in cli
     # --close-group 的语义要在帮助里写清：解散分组、保留标签
     assert "解散分组" in cli
 

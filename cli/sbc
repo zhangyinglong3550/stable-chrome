@@ -749,6 +749,8 @@ def cmd_start_task(args: argparse.Namespace) -> int:
         params["title"] = args.title
     if getattr(args, "color", None):
         params["color"] = args.color
+    if getattr(args, "keep", False):
+        params["keep"] = True
     # 默认独立窗口（不 focus）；只有显式 --same-window 才和用户同窗
     if getattr(args, "same_window", False):
         params["window"] = False
@@ -760,9 +762,27 @@ def cmd_start_task(args: argparse.Namespace) -> int:
 
 
 def cmd_end_task(args: argparse.Namespace) -> int:
+    keep = bool(getattr(args, "keep", False))
+    close_group = bool(args.close_group) and not keep
+    # 默认关掉自己打开的标签。--keep 留下；单独 --close-group 只解散、不关页。
+    if keep or (args.close_group and not args.close_tabs):
+        close_tabs = False
+    else:
+        close_tabs = True
     r = run_cmd(
         "endTask",
-        {"closeGroup": bool(args.close_group), "closeTabs": bool(args.close_tabs)},
+        {"closeGroup": close_group, "closeTabs": close_tabs, "keep": keep},
+    )
+    return out(r, 0 if r.get("ok") else 1)
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    r = run_cmd(
+        "sweep",
+        {
+            "dryRun": bool(getattr(args, "dry_run", False)),
+            "includeKeep": bool(getattr(args, "include_keep", False)),
+        },
     )
     return out(r, 0 if r.get("ok") else 1)
 
@@ -1020,16 +1040,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep agent tabs in the current Chrome window (disables --window)",
     )
+    s.add_argument(
+        "--keep",
+        action="store_true",
+        help="交付页：这个任务的分组不参与空闲回收",
+    )
     s.set_defaults(func=cmd_start_task)
 
-    e = sub.add_parser("end-task", help="end task")
+    e = sub.add_parser("end-task", help="end task; default closes tabs this task opened")
     e.add_argument("--close-group", action="store_true", help="解散分组（组内标签保留，散落回窗口）")
     e.add_argument(
         "--close-tabs",
         action="store_true",
-        help="关闭组内全部标签（任务确认完成、页面只是手段时用）；分组随之消失",
+        help="关闭组内由本任务打开的标签（现为默认）；分组空了会消失",
+    )
+    e.add_argument(
+        "--keep",
+        action="store_true",
+        help="保留分组和标签，并免除 10 分钟空闲回收",
     )
     e.set_defaults(func=cmd_end_task)
+
+    sw = sub.add_parser("sweep", help="close idle agent tab groups (sbc · / Agent 任务)")
+    sw.add_argument("--dry-run", action="store_true", help="只列出将关闭的分组，不关")
+    sw.add_argument(
+        "--include-keep",
+        action="store_true",
+        help="连 --keep 留下的分组一起关",
+    )
+    sw.set_defaults(func=cmd_sweep)
 
     sub.add_parser(
         "reload-extension",

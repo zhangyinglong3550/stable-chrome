@@ -90,6 +90,30 @@ def test_ensure_task_group_does_not_adopt_user_groups():
     assert "windowId: tab.windowId" in source
 
 
+def test_group_lease_reaps_only_owned_agent_tabs():
+    source = BACKGROUND.read_text()
+    cli = CLI.read_text()
+    skill = (Path(__file__).parents[1] / "skill" / "SKILL.md").read_text()
+    assert "GROUP_TITLE_PREFIX = 'sbc · '" in source
+    assert "IDLE_TTL_MS = 10 * 60 * 1000" in source
+    assert "IDLE_WARN_MS = 5 * 60 * 1000" in source
+    assert "async function reapIdleGroups" in source
+    assert "async function sweepGroups" in source
+    assert "function spareFromRecord" in source
+    assert "tab.pinned" in source
+    assert "adoptedTabIds" in source
+    assert "dockWindowId" in source
+    assert "不关闭就不失忆" in source
+    # 升级前的「Agent 任务」只走 sweep，不进闹钟回收
+    assert "升级前已堆着的「Agent 任务」只交给 sbc sweep" in source
+    assert '"--keep"' in cli
+    assert "def cmd_sweep" in cli
+    assert '"--dry-run"' in cli
+    assert "sbc sweep" in skill
+    assert "end-task --keep" in skill
+    assert "默认永不自动关闭" not in skill
+
+
 def test_close_tab_command_exists():
     source = BACKGROUND.read_text()
     cli = CLI.read_text()

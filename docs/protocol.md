@@ -68,7 +68,7 @@
 | `claimTab` | 接管指定 tabId，并设为任务根 |
 | `claimCurrentTab` | 接管当前活动标签 |
 | `startTask` | 开始任务（建/更新分组） |
-| `endTask` | 结束任务（可选解散分组） |
+| `endTask` | 结束任务。`closeTabs` 关闭本任务打开的标签（CLI 默认 true）；`keep` 留下并免除空闲回收；`closeGroup` 只解散分组 |
 | `setGroupTitle` | 改任务分组标题 |
 | `newTab` | 新开标签（默认进任务分组） |
 | `goto` | 导航 |

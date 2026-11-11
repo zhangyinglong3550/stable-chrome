@@ -11,6 +11,12 @@ const HELLO_EVERY_MS = 5000;
 const POLL_STALL_MS = 60000;
 const DEFAULT_TASK_TITLE = 'Agent 任务';
 const STATE_STORAGE_KEY = 'stableChromeTaskState';
+const LEDGER_KEY = 'stableChromeGroupLedger';
+const GROUP_TITLE_PREFIX = 'sbc · ';
+const CLOSING_SUFFIX = ' · 待关闭';
+// 手段页租约：10 分钟没有任何命令、用户也没再看这个组，就回收。
+const IDLE_TTL_MS = 10 * 60 * 1000;
+const IDLE_WARN_MS = 5 * 60 * 1000;
 
 // SW 被 Chrome 挂起后，上下文重置，pollLoop 会停掉。
 // alarm 唤醒时用此标志判断是否需要重新启动。
@@ -39,9 +45,22 @@ const state = {
   taskWindowId: null,
   /** start-task --window：首次开页时再建独立窗口（deferred） */
   preferTaskWindow: false,
+  /** 交付页：不参与空闲回收。只对当前任务生效，结束时写入分组账本 */
+  keep: false,
+  /** 扩展自己创建的标签。回收时只关这些 */
+  ownedTabIds: [],
+  /** claim 接管的用户原标签。永不自动关 */
+  adoptedTabIds: [],
+  /** 最近一次任务命令的时间，空闲回收用 */
+  lastTouchedAt: 0,
+  /** 跨 end-task 保留的 Agent 窗口，避免每次任务都新开一扇 */
+  dockWindowId: null,
   pollAbort: false,
   debuggerAttached: new Set(), // tabId numbers
 };
+
+/** 自己创建的分组账本。groupId 只在本次浏览器会话内有效 */
+let ledger = { groups: {} };
 
 function snapshotTaskState() {
   return {
@@ -53,6 +72,11 @@ function snapshotTaskState() {
     claimedTabId: state.claimedTabId,
     taskWindowId: state.taskWindowId,
     preferTaskWindow: state.preferTaskWindow,
+    keep: state.keep,
+    ownedTabIds: state.ownedTabIds.slice(),
+    adoptedTabIds: state.adoptedTabIds.slice(),
+    lastTouchedAt: state.lastTouchedAt,
+    dockWindowId: state.dockWindowId,
   };
 }
 
@@ -86,9 +110,323 @@ async function loadPersistedTaskState() {
     state.claimedTabId = saved.claimedTabId ?? null;
     state.taskWindowId = saved.taskWindowId ?? null;
     state.preferTaskWindow = Boolean(saved.preferTaskWindow);
+    state.keep = Boolean(saved.keep);
+    state.ownedTabIds = Array.isArray(saved.ownedTabIds) ? saved.ownedTabIds.map(Number).filter(Number.isFinite) : [];
+    state.adoptedTabIds = Array.isArray(saved.adoptedTabIds) ? saved.adoptedTabIds.map(Number).filter(Number.isFinite) : [];
+    state.lastTouchedAt = Number(saved.lastTouchedAt) || 0;
+    state.dockWindowId = saved.dockWindowId ?? null;
   } catch (e) {
     console.warn('[stable-chrome] loadPersistedTaskState failed', e);
   }
+}
+
+function logicalTitle(title) {
+  let t = String(title || '').trim();
+  if (t.startsWith(GROUP_TITLE_PREFIX)) t = t.slice(GROUP_TITLE_PREFIX.length);
+  if (t.endsWith(CLOSING_SUFFIX)) t = t.slice(0, -CLOSING_SUFFIX.length);
+  t = t.trim();
+  return t || DEFAULT_TASK_TITLE;
+}
+
+function formatGroupTitle(title, closing) {
+  const core = `${GROUP_TITLE_PREFIX}${logicalTitle(title)}`;
+  return closing ? `${core}${CLOSING_SUFFIX}` : core;
+}
+
+/** 能安全认领的旧分组：新前缀，或升级前的默认标题「Agent 任务」。自定义标题不动。 */
+function isSweepableTitle(title) {
+  const t = String(title || '').trim();
+  if (!t) return false;
+  if (t.startsWith(GROUP_TITLE_PREFIX)) return true;
+  const bare = t.endsWith(CLOSING_SUFFIX) ? t.slice(0, -CLOSING_SUFFIX.length).trim() : t;
+  return bare === DEFAULT_TASK_TITLE;
+}
+
+function rememberOwned(tabId) {
+  const id = Number(tabId);
+  if (!Number.isFinite(id)) return;
+  if (!state.ownedTabIds.includes(id)) state.ownedTabIds.push(id);
+  state.adoptedTabIds = state.adoptedTabIds.filter((x) => x !== id);
+}
+
+function rememberAdopted(tabId) {
+  const id = Number(tabId);
+  if (!Number.isFinite(id)) return;
+  if (state.ownedTabIds.includes(id)) return;
+  if (!state.adoptedTabIds.includes(id)) state.adoptedTabIds.push(id);
+}
+
+async function loadLedger() {
+  try {
+    const data = await chrome.storage.local.get(LEDGER_KEY);
+    const saved = data?.[LEDGER_KEY];
+    if (!saved || typeof saved !== 'object') return;
+    ledger = {
+      groups: saved.groups && typeof saved.groups === 'object' ? saved.groups : {},
+    };
+    if (saved.dockWindowId != null && state.dockWindowId == null) {
+      state.dockWindowId = saved.dockWindowId;
+    }
+  } catch (e) {
+    console.warn('[stable-chrome] loadLedger failed', e);
+  }
+}
+
+async function persistLedger() {
+  try {
+    await chrome.storage.local.set({
+      [LEDGER_KEY]: { groups: ledger.groups, dockWindowId: state.dockWindowId },
+    });
+  } catch (e) {
+    console.warn('[stable-chrome] persistLedger failed', e);
+  }
+}
+
+async function upsertLedger(groupId, patch) {
+  if (groupId == null) return null;
+  const key = String(groupId);
+  const prev = ledger.groups[key] || {
+    createdAt: Date.now(),
+    ownedTabIds: [],
+    adoptedTabIds: [],
+    keep: false,
+  };
+  ledger.groups[key] = { ...prev, ...patch, groupId };
+  await persistLedger();
+  return ledger.groups[key];
+}
+
+function leaseRecordForActiveGroup() {
+  return {
+    title: state.taskTitle,
+    windowId: state.taskWindowId,
+    keep: state.keep === true,
+    lastTouchedAt: state.lastTouchedAt || Date.now(),
+    ownedTabIds: state.ownedTabIds.slice(),
+    adoptedTabIds: state.adoptedTabIds.slice(),
+  };
+}
+
+/** 钉住的、claim 来的、以及用户拖进组里的标签都不关。所有权列表为空时只放过前两类（升级前的旧组）。 */
+function spareFromRecord(tab, rec) {
+  if (!tab || tab.id == null) return true;
+  if (tab.pinned) return true;
+  const adopted = Array.isArray(rec?.adoptedTabIds) ? rec.adoptedTabIds : [];
+  const owned = Array.isArray(rec?.ownedTabIds) ? rec.ownedTabIds : [];
+  if (adopted.includes(tab.id)) return true;
+  if (owned.length > 0 && !owned.includes(tab.id)) return true;
+  return false;
+}
+
+async function closeOwnedTabsInGroup(groupId, rec) {
+  const tabs = await chrome.tabs.query({ groupId });
+  const closed = [];
+  const spared = [];
+  for (const tab of tabs) {
+    if (tab.groupId !== groupId || tab.id == null) continue;
+    try {
+      if (spareFromRecord(tab, rec)) {
+        const adopted = Array.isArray(rec?.adoptedTabIds) && rec.adoptedTabIds.includes(tab.id);
+        // 用户原来的标签退出任务组，页面留下。
+        if (adopted && !tab.pinned) await chrome.tabs.ungroup(tab.id);
+        spared.push(tab.id);
+        continue;
+      }
+      if (rec && rec.keep === true) {
+        spared.push(tab.id);
+        continue;
+      }
+      await chrome.tabs.remove(tab.id);
+      closed.push(tab.id);
+    } catch {}
+  }
+  let remaining = 0;
+  try {
+    remaining = (await chrome.tabs.query({ groupId })).length;
+  } catch {}
+  if (!remaining) delete ledger.groups[String(groupId)];
+  await persistLedger();
+  return { closed, spared, remaining };
+}
+
+async function resolveDockWindow() {
+  const candidates = [state.dockWindowId, state.taskWindowId];
+  for (const id of candidates) {
+    if (id == null) continue;
+    try {
+      await chrome.windows.get(id);
+      state.dockWindowId = id;
+      state.taskWindowId = id;
+      return id;
+    } catch {
+      if (state.dockWindowId === id) state.dockWindowId = null;
+      if (state.taskWindowId === id) state.taskWindowId = null;
+    }
+  }
+  return null;
+}
+
+async function closeDockIfEmpty() {
+  const id = state.dockWindowId;
+  if (id == null) return { closed: false };
+  try {
+    const win = await chrome.windows.get(id, { populate: true });
+    const tabs = win.tabs || [];
+    if (tabs.length === 0) {
+      try {
+        await chrome.windows.remove(id);
+      } catch {}
+      if (state.dockWindowId === id) state.dockWindowId = null;
+      if (state.taskWindowId === id) state.taskWindowId = null;
+      await persistLedger();
+      return { closed: true };
+    }
+    return { closed: false, tabCount: tabs.length };
+  } catch {
+    if (state.dockWindowId === id) state.dockWindowId = null;
+    if (state.taskWindowId === id) state.taskWindowId = null;
+    await persistLedger();
+    return { closed: false, missing: true };
+  }
+}
+
+function clearActiveTaskPointer() {
+  state.taskActive = false;
+  state.taskGroupId = null;
+  state.taskGroupColor = null;
+  state.claimedTabId = null;
+  state.rootTabId = null;
+  state.ownedTabIds = [];
+  state.adoptedTabIds = [];
+  state.keep = false;
+}
+
+async function groupLastSeen(groupId, rec) {
+  let seen = Number(rec?.lastTouchedAt) || 0;
+  try {
+    const tabs = await chrome.tabs.query({ groupId });
+    for (const tab of tabs) seen = Math.max(seen, tab.lastAccessed || 0);
+  } catch {}
+  return seen;
+}
+
+async function reapIdleGroups() {
+  await loadLedger();
+  const now = Date.now();
+  let groups = [];
+  try {
+    groups = await chrome.tabGroups.query({});
+  } catch {
+    return { reaped: [] };
+  }
+  const reaped = [];
+  for (const g of groups) {
+    const key = String(g.id);
+    const rec = ledger.groups[key];
+    const managedTitle = String(g.title || '').trim().startsWith(GROUP_TITLE_PREFIX);
+    // 升级前已堆着的「Agent 任务」只交给 sbc sweep，不在闹钟里突然关掉。
+    if (!rec && !managedTitle) continue;
+    // 用户改掉了 sbc 前缀，当成要留下。
+    if (rec && !isSweepableTitle(g.title)) {
+      rec.keep = true;
+      continue;
+    }
+    if (rec?.keep) continue;
+    const seen = await groupLastSeen(g.id, rec);
+    if (!seen) continue;
+    const age = now - seen;
+    if (age >= IDLE_TTL_MS) {
+      const outcome = await closeOwnedTabsInGroup(g.id, rec || { ownedTabIds: [], adoptedTabIds: [] });
+      if (state.taskGroupId === g.id && outcome.remaining === 0) clearActiveTaskPointer();
+      // 剩下的都是钉住或用户标签：别每 15 秒再试一次。
+      if (outcome.remaining > 0 && outcome.closed.length === 0) {
+        const left = ledger.groups[String(g.id)];
+        if (left) left.keep = true;
+      }
+      await closeDockIfEmpty();
+      reaped.push({ groupId: g.id, title: g.title, ...outcome });
+    } else if (age >= IDLE_WARN_MS) {
+      const nextTitle = formatGroupTitle(rec?.title || g.title, true);
+      if (g.title !== nextTitle || !g.collapsed) {
+        try {
+          await chrome.tabGroups.update(g.id, { title: nextTitle, collapsed: true });
+        } catch {}
+      }
+    }
+  }
+  await persistLedger();
+  await persistTaskState();
+  return { reaped };
+}
+
+async function sweepGroups(params = {}) {
+  await loadLedger();
+  const dryRun = params.dryRun === true;
+  const includeKeep = params.includeKeep === true;
+  let groups = [];
+  try {
+    groups = await chrome.tabGroups.query({});
+  } catch (e) {
+    throw new Error(`sweep failed: ${e?.message || e}`);
+  }
+  const plan = [];
+  for (const g of groups) {
+    if (!isSweepableTitle(g.title)) continue;
+    const rec = ledger.groups[String(g.id)];
+    const kept = Boolean(rec?.keep);
+    if (kept && !includeKeep && !dryRun) continue;
+    const tabs = await chrome.tabs.query({ groupId: g.id });
+    plan.push({
+      groupId: g.id,
+      title: g.title || '',
+      windowId: g.windowId,
+      keep: kept,
+      wouldClose: !kept || includeKeep,
+      tabCount: tabs.length,
+      tabs: tabs.map((t) => ({
+        id: t.id,
+        title: t.title || '',
+        url: t.url || '',
+        pinned: Boolean(t.pinned),
+      })),
+    });
+  }
+  if (dryRun) {
+    return {
+      dryRun: true,
+      groups: plan,
+      note: '只列出标题为「sbc · …」或「Agent 任务」的分组。keep 为 true 的要加 --include-keep 才会关。自定义标题的旧分组不会动。',
+    };
+  }
+  const results = [];
+  for (const item of plan) {
+    const rec = ledger.groups[String(item.groupId)] || { ownedTabIds: [], adoptedTabIds: [] };
+    if (includeKeep) rec.keep = false;
+    const outcome = await closeOwnedTabsInGroup(item.groupId, rec);
+    if (state.taskGroupId === item.groupId && outcome.remaining === 0) clearActiveTaskPointer();
+    results.push({ groupId: item.groupId, title: item.title, ...outcome });
+  }
+  await closeDockIfEmpty();
+  await persistTaskState();
+  return { dryRun: false, groups: results };
+}
+
+async function touchLease() {
+  const now = Date.now();
+  state.lastTouchedAt = now;
+  if (state.taskGroupId == null) {
+    await persistTaskState();
+    return;
+  }
+  await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
+  try {
+    const g = await chrome.tabGroups.get(state.taskGroupId);
+    const next = formatGroupTitle(state.taskTitle, false);
+    if (g && (g.title !== next || g.collapsed)) {
+      await chrome.tabGroups.update(state.taskGroupId, { title: next, collapsed: false });
+    }
+  } catch {}
+  await persistTaskState();
 }
 
 /** 校验内存里的 tab/group id 是否仍有效；失效则清掉并写回 storage */
@@ -142,6 +480,14 @@ async function reconcileTaskState() {
   if (state.claimedTabId == null && state.taskGroupId == null) {
     state.taskActive = false;
   }
+  // 升级前没有所有权记录。已接管的标签宁可当成用户的，避免第一次 end-task 把它关掉。
+  if (
+    state.claimedTabId != null &&
+    state.ownedTabIds.length === 0 &&
+    state.adoptedTabIds.length === 0
+  ) {
+    rememberAdopted(state.claimedTabId);
+  }
   await persistTaskState();
 }
 
@@ -163,9 +509,34 @@ function wantsTaskWindow(params = {}) {
  * - 否则：建 unfocused 空白窗，并把其中标签作为 claimed 根
  */
 async function ensureAgentWindow(params = {}) {
+  const dock = await resolveDockWindow();
+  if (dock != null && state.claimedTabId == null) {
+    state.preferTaskWindow = true;
+    return { windowId: dock, created: false, moved: false, reusedDock: true };
+  }
+  if (dock != null && state.claimedTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(state.claimedTabId);
+      if (tab?.id != null) {
+        let moved = false;
+        if (tab.windowId !== dock) {
+          await chrome.tabs.move(tab.id, { windowId: dock, index: -1 });
+          moved = true;
+        }
+        state.taskWindowId = dock;
+        state.dockWindowId = dock;
+        state.preferTaskWindow = true;
+        return { windowId: dock, created: false, moved, reusedDock: true };
+      }
+    } catch (e) {
+      console.warn('[stable-chrome] ensureAgentWindow dock move failed', e);
+    }
+  }
+
   if (state.taskWindowId != null) {
     try {
       await chrome.windows.get(state.taskWindowId);
+      state.dockWindowId = state.taskWindowId;
       return { windowId: state.taskWindowId, created: false, moved: false };
     } catch {
       state.taskWindowId = null;
@@ -183,6 +554,7 @@ async function ensureAgentWindow(params = {}) {
           type: 'normal',
         });
         state.taskWindowId = win.id;
+        state.dockWindowId = win.id;
         state.preferTaskWindow = true;
         return { windowId: state.taskWindowId, created: true, moved: true };
       }
@@ -198,11 +570,13 @@ async function ensureAgentWindow(params = {}) {
     type: 'normal',
   });
   state.taskWindowId = win.id;
+  state.dockWindowId = win.id;
   state.preferTaskWindow = true;
   const seed = win.tabs && win.tabs[0];
   if (seed?.id != null) {
     state.claimedTabId = seed.id;
     if (state.rootTabId == null) state.rootTabId = seed.id;
+    rememberOwned(seed.id);
   }
   return {
     windowId: state.taskWindowId,
@@ -217,6 +591,9 @@ async function createTabInTaskContext(createProps = {}) {
   const props = { ...createProps };
   if (props.active == null) props.active = false;
 
+  if (state.taskWindowId == null && state.preferTaskWindow) {
+    await resolveDockWindow();
+  }
   if (state.taskWindowId != null) {
     try {
       await chrome.windows.get(state.taskWindowId);
@@ -234,18 +611,23 @@ async function createTabInTaskContext(createProps = {}) {
       type: 'normal',
     });
     state.taskWindowId = win.id;
+    state.dockWindowId = win.id;
     const tab = win.tabs && win.tabs[0];
     if (!tab?.id) throw new Error('failed to create task window tab');
+    rememberOwned(tab.id);
     return tab;
   }
 
-  return chrome.tabs.create(props);
+  const created = await chrome.tabs.create(props);
+  if (created?.id != null && (state.taskActive || state.preferTaskWindow)) rememberOwned(created.id);
+  return created;
 }
 
 function ensureStateReady() {
   if (!_stateReady) {
     _stateReady = (async () => {
       await loadPersistedTaskState();
+      await loadLedger();
       await reconcileTaskState();
     })();
   }
@@ -361,8 +743,9 @@ async function listOpenTabs() {
 }
 
 async function ensureTaskGroup(tabId, title, preferredColor) {
-  if (title) state.taskTitle = title;
+  if (title) state.taskTitle = logicalTitle(title);
   const tab = await chrome.tabs.get(tabId);
+  const shown = formatGroupTitle(state.taskTitle, false);
 
   // 1) 已有「本任务」分组：只把标签移入，绝不改名用户其它组
   if (state.taskGroupId != null) {
@@ -374,9 +757,10 @@ async function ensureTaskGroup(tabId, title, preferredColor) {
       }
       // 仅更新本任务组标题；不碰颜色（复用时保留）
       await chrome.tabGroups.update(state.taskGroupId, {
-        title: state.taskTitle,
+        title: shown,
         collapsed: false,
       });
+      await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
       return state.taskGroupId;
     } catch {
       state.taskGroupId = null;
@@ -396,13 +780,17 @@ async function ensureTaskGroup(tabId, title, preferredColor) {
   }
   const groupId = await chrome.tabs.group(groupOpts);
   await chrome.tabGroups.update(groupId, {
-    title: state.taskTitle,
+    title: shown,
     color,
     collapsed: false,
   });
   state.taskGroupId = groupId;
   state.taskGroupColor = color;
-  if (tab.windowId != null) state.taskWindowId = tab.windowId;
+  if (tab.windowId != null) {
+    state.taskWindowId = tab.windowId;
+    if (state.preferTaskWindow) state.dockWindowId = tab.windowId;
+  }
+  await upsertLedger(groupId, { ...leaseRecordForActiveGroup(), createdAt: Date.now() });
   return groupId;
 }
 
@@ -427,6 +815,7 @@ async function claimTab(tabId, title, params = {}) {
   if (Number.isNaN(id)) throw new Error('invalid tabId');
   const tab = await chrome.tabs.get(id);
   if (!tab) throw new Error('tab not found');
+  rememberAdopted(id);
   state.claimedTabId = id;
   state.rootTabId = id;
   state.taskActive = true;
@@ -475,13 +864,16 @@ async function startTask(title, params = {}) {
   await reconcileTaskState();
   state.taskActive = true;
   // 仅当调用方显式传入 title 时才改名；缺省保持已有任务名 / 默认 Agent 任务
-  if (title) state.taskTitle = title;
+  if (title) state.taskTitle = logicalTitle(title);
+  if (params.keep === true) state.keep = true;
   // 允许调用方预置颜色（等第一次 new-tab/claim 建组时用）
   if (params.color && GROUP_COLORS.includes(params.color)) {
     state.taskGroupColor = params.color;
   }
   // --window：后续 new-tab 进独立窗口；已有 claimed 时立刻拆窗
-  if (wantsTaskWindow(params)) {
+  if (params.window === false || params.sameWindow === true) {
+    state.preferTaskWindow = false;
+  } else if (wantsTaskWindow(params)) {
     state.preferTaskWindow = true;
   }
 
@@ -548,28 +940,45 @@ async function startTask(title, params = {}) {
     reused,
     createdBlank,
     deferredTab: state.claimedTabId == null,
+    keep: state.keep === true,
     window: windowInfo,
   };
 }
 
-async function endTask(closeGroup = false, closeTabs = false) {
-  state.taskActive = false;
+async function endTask(closeGroup = false, closeTabs = false, keep = false) {
   const groupId = state.taskGroupId;
-  if ((closeGroup || closeTabs) && groupId != null) {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (tab.groupId === groupId && tab.id != null) {
-        try {
-          if (closeTabs) {
-            // 真正关闭页面：任务确认完成后回收手段型标签页。
-            // 关掉组内全部标签后 Chrome 会自动解散空分组。
-            await chrome.tabs.remove(tab.id);
-          } else {
-            // 只解散分组，标签保留（散落回窗口）——默认的安全行为
+  const windowId = state.taskWindowId ?? state.dockWindowId;
+  if (windowId != null) state.dockWindowId = windowId;
+  let closedTabIds = [];
+  let sparedTabIds = [];
+
+  if (keep && groupId != null) {
+    state.keep = true;
+    await upsertLedger(groupId, { ...leaseRecordForActiveGroup(), keep: true, lastTouchedAt: Date.now() });
+  }
+
+  if ((closeGroup || closeTabs) && groupId != null && !keep) {
+    if (closeTabs) {
+      await upsertLedger(groupId, leaseRecordForActiveGroup());
+      const rec = ledger.groups[String(groupId)] || {
+        ownedTabIds: state.ownedTabIds.slice(),
+        adoptedTabIds: state.adoptedTabIds.slice(),
+      };
+      const outcome = await closeOwnedTabsInGroup(groupId, rec);
+      closedTabIds = outcome.closed;
+      sparedTabIds = outcome.spared;
+    } else {
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (tab.groupId === groupId && tab.id != null) {
+          try {
+            // 只解散分组，标签保留（散落回窗口）
             await chrome.tabs.ungroup(tab.id);
-          }
-        } catch {}
+          } catch {}
+        }
       }
+      delete ledger.groups[String(groupId)];
+      await persistLedger();
     }
   }
   // detach debuggers
@@ -579,14 +988,30 @@ async function endTask(closeGroup = false, closeTabs = false) {
     } catch {}
     state.debuggerAttached.delete(tabId);
   }
-  state.taskGroupId = null;
-  state.taskGroupColor = null;
-  state.claimedTabId = null;
-  state.rootTabId = null;
-  state.taskWindowId = null;
-  state.preferTaskWindow = false;
+
+  // 不关闭就不失忆：没关、也没要求保留时，分组和窗口继续记着，下次 start-task 复用。
+  const dropPointer = keep || closeGroup || closeTabs;
+  if (dropPointer) {
+    clearActiveTaskPointer();
+    if (windowId != null) state.dockWindowId = windowId;
+    state.taskWindowId = null;
+    await closeDockIfEmpty();
+  } else {
+    state.taskActive = false;
+    if (state.taskWindowId != null) state.dockWindowId = state.taskWindowId;
+  }
   await persistTaskState();
-  return { ended: true, closedGroup: Boolean(closeGroup), closedTabs: Boolean(closeTabs), previousGroupId: groupId };
+  await persistLedger();
+  return {
+    ended: true,
+    closedGroup: Boolean(closeGroup) && !keep,
+    closedTabs: Boolean(closeTabs) && !keep,
+    kept: Boolean(keep),
+    closedTabIds,
+    sparedTabIds,
+    previousGroupId: groupId,
+    dockWindowId: state.dockWindowId != null ? String(state.dockWindowId) : null,
+  };
 }
 
 /** 热重载扩展自身（加载磁盘上最新 background.js）。调用后 SW 会短暂离线再上线。 */
@@ -1992,6 +2417,19 @@ async function handleCommand(cmd) {
   await ensureStateReady();
   const type = cmd?.type;
   const params = cmd?.params || {};
+  const result = await dispatchCommand(type, params);
+  // ping / sweep / reload 不算任务活动，避免把租约无限续上。
+  if (type !== 'ping' && type !== 'sweep' && type !== 'reloadExtension') {
+    try {
+      await touchLease();
+    } catch (e) {
+      console.warn('[stable-chrome] touchLease', e);
+    }
+  }
+  return result;
+}
+
+async function dispatchCommand(type, params) {
   switch (type) {
     case 'ping':
       return {
@@ -2013,13 +2451,19 @@ async function handleCommand(cmd) {
     case 'startTask':
       return startTask(params.title, params);
     case 'endTask':
-      return endTask(Boolean(params.closeGroup), Boolean(params.closeTabs));
+      return endTask(Boolean(params.closeGroup), Boolean(params.closeTabs), Boolean(params.keep));
+    case 'sweep':
+      return sweepGroups(params);
     case 'reloadExtension':
       return reloadExtension();
     case 'setGroupTitle':
       if (state.taskGroupId == null) throw new Error('no task group');
-      state.taskTitle = params.title || state.taskTitle;
-      await chrome.tabGroups.update(state.taskGroupId, { title: state.taskTitle });
+      state.taskTitle = logicalTitle(params.title || state.taskTitle);
+      await chrome.tabGroups.update(state.taskGroupId, {
+        title: formatGroupTitle(state.taskTitle, false),
+        collapsed: false,
+      });
+      await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
       return { title: state.taskTitle, groupId: state.taskGroupId };
     case 'newTab':
       return newTab(params);
@@ -2124,6 +2568,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     // 早先这里写 `if (!_pollRunning)`，结果 loop 卡在 await 里时该判断恒不成立，
     // 保活反而彻底失效。
     pollLoop();
+    ensureStateReady()
+      .then(() => reapIdleGroups())
+      .catch((e) => console.warn('[stable-chrome] reapIdleGroups', e));
   }
 });
 

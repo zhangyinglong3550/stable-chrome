@@ -44,7 +44,8 @@ sbc snapshot                              # 拿到每个元素的 node 编号
 sbc click --node 12                       # 用编号点击（最稳，推荐）
 sbc fill --selector "input[name=user]" --value "xxx"
 sbc screenshot --out /tmp/a.png           # 优先 CDP 截图，不切用户标签
-sbc end-task
+sbc end-task                              # 默认关掉本任务打开的标签
+# 页面要留给人看：sbc end-task --keep
 ```
 
 ## 怎么选点击方式（按稳定性排序）
@@ -71,7 +72,7 @@ sbc end-task
 | `sbc doctor` | 扩展是否在线 |
 | `sbc open-tabs` | 列出真实标签 |
 | `sbc claim [--tab-id] [--window]` | 接管标签并建任务组；`--window` 拆到独立后台窗 |
-| `sbc start-task [--title]` | 开始/复用任务组；**默认独立后台窗**；`--same-window` 才同窗 |
+| `sbc start-task [--title] [--keep]` | 开始/复用任务组；**默认独立后台窗**；`--same-window` 才同窗；`--keep` 标记交付页，不参与空闲回收 |
 | `sbc new-tab --url` | 同任务默认单标签：有 claimed 则导航复用；`--force` 才新建第二页 |
 | `sbc close-tab [--tab-id]` | 关闭标签（默认可关当前 claimed） |
 | `sbc goto URL` | 在已 claim 标签上导航（与默认 new-tab 等价） |
@@ -84,7 +85,8 @@ sbc end-task
 | `sbc cookie-get [--name NAME] [--url URL]` | 读 cookie（**含 HttpOnly**，走 CDP，不需要 cookies 权限）；输出含明文值 |
 | `sbc wait --text|--selector` | 等待 |
 | `sbc screenshot --out` | 截图（优先 CDP `Page.captureScreenshot`，不切标签；失败才降级） |
-| `sbc end-task [--close-group] [--close-tabs]` | 结束任务；默认分组和标签都保留，`--close-group` 解散分组（标签散落回窗口），`--close-tabs` 真正关闭组内页面 |
+| `sbc end-task [--keep] [--close-tabs] [--close-group]` | 结束任务。**默认关闭本任务打开的标签**；`--keep` 留下并免除回收；`--close-group` 只解散分组、标签还在 |
+| `sbc sweep [--dry-run] [--include-keep]` | 关掉标题为 `sbc · …` 或 `Agent 任务` 的分组。先 `--dry-run` 看清单。`--keep` 的组默认跳过 |
 | `sbc net-start [--tab-id]` | 开始 CDP 网络捕获 |
 | `sbc net-get [--tab-id] [--grep STR]` | 读取捕获的 API 请求（不停止） |
 | `sbc net-stop [--tab-id] [--grep STR]` | 停止捕获并输出所有请求 |
@@ -175,24 +177,28 @@ sbc decide --goal "点击登录按钮"
 
 ## 任务生命周期（分组什么时候关）
 
-**默认永不自动关闭** —— Agent 不该静默关掉用户可能还要看的页面。要关，必须满足「确定完成」：
-
-推荐约定（配合决策层）：
+扩展自己回收 Agent 打开的页面，不靠会话记得调用关闭。分组标题一律是 `sbc · <任务名>`。
 
 | 阶段 | 动作 |
 |---|---|
-| 开任务 | `sbc start-task`（建分组） |
-| 每步 | `sbc snapshot` → `sbc decide` → 按 `recommendedAction` 执行 |
-| decide 返回 `DONE` 且 gate=high | **先独立验证**——检查页面上真的出现了目标状态。模型说完成不算数 |
-| 验证通过 | `sbc end-task --close-group`（解散分组，标签保留） |
-| 页面只是手段、确定没用了 | `sbc end-task --close-tabs`（真正关闭组内页面，分组随之消失） |
+| 开任务 | `sbc start-task`（复用同一个 Agent 窗口；分组前缀 `sbc ·`） |
+| 页面要留给人看 | `sbc start-task --keep` 或结束时 `sbc end-task --keep` |
+| 每步 | `sbc snapshot` → `sbc decide` → 按返回的操作执行 |
+| decide 返回 `DONE` | **先独立验证**页面上真的到了目标状态，再 `sbc end-task` |
+| 收尾 | `sbc end-task`：**默认关闭本任务打开的标签**。空分组和空的 Agent 窗口一起消失 |
+| 已经堆着的旧组 | `sbc sweep --dry-run` 看清单，再 `sbc sweep` |
 
-**两类任务要区分**：
+**不会被自动关掉的：**
 
-- **手段型**（页面只是工具：查个数、点个按钮、填个表单）→ 完成后 `--close-tabs` 合理
-- **交付型**（页面本身就是结果：仪表盘、调试环境、留给用户看的页面）→ **永远不要自动关**
+- `claim` 接管的、用户原来就开着的标签（结束时只退出任务组，页面还在）
+- 钉住的标签
+- 用户从外面拖进任务组、不是本任务创建的标签
+- `--keep` 的分组
+- 标题不是 `sbc · …` 也不是 `Agent 任务` 的分组
 
-就算忘了收尾也无妨——分组积累不影响任何功能，定期人工清理即可。
+**空闲回收：**本任务的分组超过 10 分钟没有命令、用户也没有再打开其中的标签，扩展会关掉它。满 5 分钟先折叠，标题加上 `· 待关闭`。下一条命令会把它展开。忘了 `end-task` 也会收掉，不用再人工清。
+
+升级前已经留下的「Agent 任务」分组不会被闹钟突然关掉。用 `sbc sweep` 清。自定义标题的旧分组认不出主人，sweep 不会动。
 
 ## 硬规则
 
@@ -208,6 +214,7 @@ sbc decide --goal "点击登录按钮"
 10. **同任务永远单标签**：`new-tab` 默认 = 导航复用 claimed 标签；只有显式 `--force` 才开第二页
 11. **不收养用户工作区分组**：`claim` / `start-task` 不会把你已有的标签组改名成任务组；会把目标标签拆出单独建 Agent 组
 12. **`click` 默认不抢焦点**：合成事件在后台标签可用；只有显式 `--trusted` 才走 CDP 并把标签提到前台。后台标签收不到 CDP 的 `mousePressed`，这是 Chrome 的行为，不是 bug
+13. **默认关掉自己打开的标签**：`end-task` 不要再指望分组会留下。要给人看的页面必须 `--keep`。不要用 `--close-group` 当收尾，那会把标签散回窗口，以后认不出是谁开的
 
 ## Agent 用法注意
 - 一次会话：`start-task` 一次（默认独立窗）→ 反复 `new-tab --url` 只会在同一标签跳转
