@@ -78,7 +78,9 @@ def test_resolve_tab_does_not_fall_back_to_user_tab_when_task_active():
 
 def test_manual_tabs_still_not_auto_grouped():
     source = BACKGROUND.read_text()
-    assert "chrome.tabs.onCreated.addListener" not in source
+    assert "async function noteSpawnedTab" in source
+    assert "tab.openerTabId == null" in source
+    assert "function expandOwnedFromOpeners" in source
     assert "chrome.tabs.onUpdated.addListener" not in source
 
 

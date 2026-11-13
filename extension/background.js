@@ -214,21 +214,104 @@ function spareFromRecord(tab, rec) {
   return false;
 }
 
+/** 任务标签 window.open / 点链接开出的页也算任务自己的。claim 来的用户标签不往下传。 */
+function expandOwnedFromOpeners(tabs, ownedIds, adoptedIds) {
+  const owned = new Set((ownedIds || []).map(Number).filter(Number.isFinite));
+  const adopted = new Set((adoptedIds || []).map(Number).filter(Number.isFinite));
+  if (owned.size === 0) return owned;
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const tab of tabs) {
+      const id = Number(tab?.id);
+      if (!Number.isFinite(id) || owned.has(id) || adopted.has(id) || tab.pinned) continue;
+      const opener = Number(tab.openerTabId);
+      if (Number.isFinite(opener) && owned.has(opener)) {
+        owned.add(id);
+        grew = true;
+      }
+    }
+  }
+  return owned;
+}
+
+function ownershipOf(openerId) {
+  if (state.ownedTabIds.includes(openerId)) {
+    return { via: 'state', groupId: state.taskGroupId };
+  }
+  for (const [key, rec] of Object.entries(ledger.groups)) {
+    const owned = Array.isArray(rec?.ownedTabIds) ? rec.ownedTabIds.map(Number) : [];
+    if (owned.includes(openerId)) return { via: 'ledger', groupId: Number(key), rec };
+  }
+  return null;
+}
+
+/** 只认领「从已拥有的任务标签开出来」的新标签。用户自己 Ctrl+T 或从 claim 页开的不进组。 */
+async function noteSpawnedTab(tab) {
+  if (!tab || tab.id == null || tab.openerTabId == null) return;
+  await ensureStateReady();
+  const childId = Number(tab.id);
+  const openerId = Number(tab.openerTabId);
+  if (!Number.isFinite(childId) || !Number.isFinite(openerId)) return;
+  const hit = ownershipOf(openerId);
+  if (!hit) return;
+
+  if (hit.via === 'state') {
+    rememberOwned(childId);
+    if (state.taskGroupId != null) {
+      await upsertLedger(state.taskGroupId, leaseRecordForActiveGroup());
+    }
+  } else {
+    const next = Array.from(new Set([...(hit.rec?.ownedTabIds || []).map(Number), childId]));
+    await upsertLedger(hit.groupId, { ownedTabIds: next });
+  }
+
+  try {
+    const opener = await chrome.tabs.get(openerId);
+    const dest = opener.groupId != null && opener.groupId !== -1 ? opener.groupId : hit.groupId;
+    if (dest == null) return;
+    const current = await chrome.tabs.get(childId);
+    if (!current || current.pinned || current.groupId === dest) return;
+    await chrome.tabs.group({ tabIds: [childId], groupId: dest });
+  } catch (e) {
+    console.warn('[stable-chrome] noteSpawnedTab group', e);
+  }
+}
+
 async function closeOwnedTabsInGroup(groupId, rec) {
-  const tabs = await chrome.tabs.query({ groupId });
+  const record = rec || { ownedTabIds: [], adoptedTabIds: [] };
+  let allTabs = [];
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch {}
+  if (!allTabs.length) {
+    try {
+      allTabs = await chrome.tabs.query({ groupId });
+    } catch {}
+  }
+  const expanded = expandOwnedFromOpeners(allTabs, record.ownedTabIds, record.adoptedTabIds);
+  const effective = {
+    ...record,
+    ownedTabIds: (record.ownedTabIds || []).length ? Array.from(expanded) : record.ownedTabIds || [],
+  };
+  const tabs = allTabs.filter((t) => t.groupId === groupId);
+  const loose = (record.ownedTabIds || []).length && record.keep !== true
+    ? allTabs.filter((t) => t?.id != null && expanded.has(t.id) && t.groupId !== groupId)
+    : [];
   const closed = [];
   const spared = [];
-  for (const tab of tabs) {
-    if (tab.groupId !== groupId || tab.id == null) continue;
+  for (const tab of [...tabs, ...loose]) {
+    if (tab.id == null) continue;
+    if (tab.groupId !== groupId && !expanded.has(tab.id)) continue;
     try {
-      if (spareFromRecord(tab, rec)) {
-        const adopted = Array.isArray(rec?.adoptedTabIds) && rec.adoptedTabIds.includes(tab.id);
-        // 用户原来的标签退出任务组，页面留下。
-        if (adopted && !tab.pinned) await chrome.tabs.ungroup(tab.id);
+      if (spareFromRecord(tab, effective)) {
+        const adopted = Array.isArray(record.adoptedTabIds) && record.adoptedTabIds.includes(tab.id);
+        // 用户原来的标签退出任务组，页面留下。组外的无关标签本来就不在关闭名单里。
+        if (adopted && !tab.pinned && tab.groupId === groupId) await chrome.tabs.ungroup(tab.id);
         spared.push(tab.id);
         continue;
       }
-      if (rec && rec.keep === true) {
+      if (record.keep === true) {
         spared.push(tab.id);
         continue;
       }
@@ -821,7 +904,8 @@ async function groupTabIfNeeded(tabId) {
   try {
     if (!state.taskActive || state.taskGroupId == null) return;
     const tab = await chrome.tabs.get(tabId);
-    if (!tab?.url || isRestrictedUrl(tab.url)) return;
+    const url = tab?.pendingUrl || tab?.url || '';
+    if (!url || isRestrictedUrl(url)) return;
     if (tab.groupId === state.taskGroupId) return;
     await chrome.tabs.group({ tabIds: [tabId], groupId: state.taskGroupId });
   } catch (e) {
@@ -2573,6 +2657,10 @@ async function pollLoop() {
   }
   if (gen === _pollGen) _pollRunning = false;
 }
+
+chrome.tabs.onCreated.addListener((tab) => {
+  noteSpawnedTab(tab).catch((e) => console.warn('[stable-chrome] noteSpawnedTab', e));
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[stable-chrome] installed', chrome.runtime.id);
