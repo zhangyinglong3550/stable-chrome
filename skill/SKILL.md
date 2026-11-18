@@ -1,6 +1,6 @@
 ---
 name: stable-chrome
-description: 稳定附着用户真实 Chrome（不依赖 9222），支持 openTabs/claim/任务标签分组/DOM 操作。用户要安装/setup/加载扩展、或控制真实 Chrome / 复用登录态 / 9222 失败时：先在仓库根目录运行 python3 cli/sbc setup（Windows: python cli\sbc setup），再让用户加载 extension/。
+description: '稳定附着用户真实 Chrome（不依赖 9222），支持 openTabs/claim/任务标签分组/DOM 操作。用户要安装/setup/加载扩展、或控制真实 Chrome / 复用登录态 / 9222 失败时：先在仓库根目录运行 python3 cli/sbc setup（Windows: python cli\sbc setup），再让用户加载 extension/。'
 ---
 
 # stable-chrome
@@ -196,6 +196,8 @@ sbc decide --goal "点击登录按钮"
 - `--keep` 的分组
 
 从任务标签再开出来的页面（链接、`window.open`）算本任务打开的：立刻记入所有权、放进同一分组，`end-task` 和空闲回收一起关。没有 opener 的新标签，以及从 `claim` 来的用户标签开出来的页面，仍然留下。
+
+关掉这些标签之前会先把它们移出分组。直接关掉最后一个标签时，Chrome 会把分组留在书签栏上；先移出分组，那份保存分组会一起删掉。`--keep` 的分组不动。
 
 **空闲回收：**标签组超过 10 分钟没有命令、用户也没有再打开其中的标签，扩展会关掉它。满 5 分钟先折叠，不改组名。下一条命令会把它展开。忘了 `end-task` 也会收掉。重载扩展后，旧版本写在组名前面的标记会自动去掉。
 

@@ -300,6 +300,7 @@ async function closeOwnedTabsInGroup(groupId, rec) {
     : [];
   const closed = [];
   const spared = [];
+  const closing = [];
   for (const tab of [...tabs, ...loose]) {
     if (tab.id == null) continue;
     if (tab.groupId !== groupId && !expanded.has(tab.id)) continue;
@@ -315,6 +316,21 @@ async function closeOwnedTabsInGroup(groupId, rec) {
         spared.push(tab.id);
         continue;
       }
+      closing.push(tab);
+    } catch {}
+  }
+  // Chrome 把「关掉分组里最后一个标签」当成关闭分组，书签栏上的保存分组会留下。
+  // 先把要关的标签移出分组，最后一个标签离组时保存分组才会被删掉。
+  const inGroup = closing.filter((t) => t.groupId === groupId).map((t) => t.id);
+  if (inGroup.length) {
+    try {
+      await chrome.tabs.ungroup(inGroup);
+    } catch (e) {
+      console.warn('[stable-chrome] ungroup saved group', e);
+    }
+  }
+  for (const tab of closing) {
+    try {
       await chrome.tabs.remove(tab.id);
       closed.push(tab.id);
     } catch {}
@@ -2520,6 +2536,44 @@ async function cookieGet(params = {}) {
   };
 }
 
+/**
+ * 把一个站点的 cookie（含 HttpOnly）复制到本机地址，用于本地前端带登录态调试。
+ *
+ * 只允许目标是 localhost / 127.0.0.1，防止把登录凭证复制到任意外部站点。
+ * 返回只含 cookie 名称，不回传 value。
+ *
+ * params: { from, to, names?, tabId? }
+ */
+async function cookieCopy(params = {}) {
+  const { from, to } = params;
+  if (!from || !/^https?:/i.test(from)) throw new Error(`cookieCopy 需要 from（http(s) url）`);
+  let target;
+  try { target = new URL(to); } catch (_) { throw new Error(`cookieCopy 需要合法的 to url（当前：${to || '空'}）`); }
+  if (!['localhost', '127.0.0.1'].includes(target.hostname)) {
+    throw new Error(`cookieCopy 只允许复制到 localhost / 127.0.0.1（当前：${target.hostname}）`);
+  }
+  const tabId = await resolveTabId(params);
+  await ensureDebugger(tabId);
+  const res = await chrome.debugger.sendCommand({ tabId }, 'Network.getCookies', { urls: [from] });
+  const all = res?.cookies || [];
+  const picked = Array.isArray(params.names) && params.names.length
+    ? all.filter((c) => params.names.includes(c.name))
+    : all;
+  const origin = `${target.protocol}//${target.host}/`;
+  const cookies = picked.map((c) => ({
+    name: c.name,
+    value: c.value,
+    url: origin,
+    path: '/',
+    httpOnly: !!c.httpOnly,
+    secure: false,
+  }));
+  if (cookies.length) {
+    await chrome.debugger.sendCommand({ tabId }, 'Network.setCookies', { cookies });
+  }
+  return { tabId: String(tabId), from, to: origin, count: cookies.length, names: cookies.map((c) => c.name) };
+}
+
 async function handleCommand(cmd) {
   await ensureStateReady();
   const type = cmd?.type;
@@ -2584,6 +2638,8 @@ async function dispatchCommand(type, params) {
       return evalCmd(params);
     case 'cookieGet':
       return cookieGet(params);
+    case 'cookieCopy':
+      return cookieCopy(params);
     case 'snapshot':
       return snapshot(params);
     case 'click':

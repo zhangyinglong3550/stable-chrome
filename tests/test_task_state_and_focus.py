@@ -117,6 +117,8 @@ def test_group_lease_reaps_only_owned_agent_tabs():
     assert "sbc sweep" in skill
     assert "end-task --keep" in skill
     assert "默认永不自动关闭" not in skill
+    assert "await chrome.tabs.ungroup(inGroup)" in source
+    assert "保存分组才会被删掉" in source
 
 
 def test_close_tab_command_exists():

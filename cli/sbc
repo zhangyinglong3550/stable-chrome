@@ -875,6 +875,17 @@ def cmd_cookie_get(args: argparse.Namespace) -> int:
     return out(r, 0 if r.get("ok") else 1)
 
 
+def cmd_cookie_copy(args: argparse.Namespace) -> int:
+    """把站点 cookie（含 HttpOnly）复制到 localhost，供本地前端带登录态调试。只输出 cookie 名称。"""
+    params: Dict[str, Any] = {"from": args.src, "to": args.dst}
+    if args.name:
+        params["names"] = args.name
+    if args.tab_id:
+        params["tabId"] = args.tab_id
+    r = run_cmd("cookieCopy", params)
+    return out(r, 0 if r.get("ok") else 1)
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     params: Dict[str, Any] = {"max": args.max}
     if args.tab_id:
@@ -1136,6 +1147,13 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("--url", help="cookie url; defaults to the target tab's current url")
     ck.add_argument("--tab-id")
     ck.set_defaults(func=cmd_cookie_get)
+
+    cc = sub.add_parser("cookie-copy", help="copy cookies (incl. HttpOnly) from a site to localhost; prints names only")
+    cc.add_argument("--from", dest="src", required=True, help="source url, e.g. http://iot-power.ttb.test.ke.com/")
+    cc.add_argument("--to", dest="dst", required=True, help="target url, must be localhost / 127.0.0.1")
+    cc.add_argument("--name", action="append", help="only these cookie names (repeatable)")
+    cc.add_argument("--tab-id")
+    cc.set_defaults(func=cmd_cookie_copy)
 
     sn = sub.add_parser("snapshot", help="list interactive elements")
     sn.add_argument("--max", type=int, default=80)
