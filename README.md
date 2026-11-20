@@ -156,7 +156,7 @@ function sbc { python "$PWD\cli\sbc" @args }
 
 ## 升级已有安装
 
-**没有独立的打包/发布流程** —— 仓库本身就是发行版：扩展从 `extension/` 目录直接加载（未打包），CLI 是纯 Python 标准库单文件，skill 是一份 Markdown。升级三步：
+可以从 [GitHub Releases](https://github.com/zhangyinglong3550/stable-chrome/releases) 下载 ZIP，解压后按上面的「快速开始」安装。通过 Git 克隆安装的用户，在仓库目录运行：
 
 ```bash
 git pull
@@ -165,7 +165,7 @@ python3 cli/sbc setup        # 重新同步 SKILL.md 到各 Agent 目录
 
 然后到 `chrome://extensions/` 点 stable-chrome 的 🔄 **重新加载** —— 扩展代码变了，MV3 **不会自动热更新**。
 
-**验证**：`python3 cli/sbc doctor` 输出里的 `version` 应为 `0.2.2`；skill 是否同步可对比 `skill/SKILL.md` 与 `~/.claude/skills/stable-chrome/SKILL.md`。
+**验证**：`python3 cli/sbc doctor` 输出里的 `version` 应与 `extension/manifest.json` 一致；skill 是否同步可对比 `skill/SKILL.md` 与 `~/.claude/skills/stable-chrome/SKILL.md`。
 
 ---
 
