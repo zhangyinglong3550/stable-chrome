@@ -1286,6 +1286,15 @@ async function closeTab(params = {}) {
   }
   if (Number.isNaN(tabId)) throw new Error('invalid tabId');
   try {
+    const { groupId } = await chrome.tabs.get(tabId);
+    const record = ledger.groups[String(groupId)];
+    const activeGroup = groupId === state.taskGroupId;
+    const taskGroup = activeGroup || record?.ownedTabIds?.length || record?.adoptedTabIds?.length;
+    if (groupId !== -1 && taskGroup && !record?.keep && !(activeGroup && state.keep)) {
+      const tabs = await chrome.tabs.query({ groupId });
+      // 把最后一页先移出组，避免 Chrome 保留已关闭的分组。
+      if (tabs.length === 1 && tabs[0].id === tabId) await chrome.tabs.ungroup(tabId);
+    }
     await chrome.tabs.remove(tabId);
   } catch (e) {
     throw new Error(`closeTab failed: ${e?.message || e}`);
